@@ -1,7 +1,7 @@
 import streamlit as st
 import requests
 
-API = "http://localhost:8000"
+API = "https://ai-coach-backend-xc9s.onrender.com"
 
 st.title("🏊 AI Triathlon Coach")
 
