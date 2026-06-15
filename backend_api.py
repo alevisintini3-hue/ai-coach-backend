@@ -801,14 +801,12 @@ async def chat(request: ChatMessage):
                 payload = make_payload(wo["name"], wo["sport"], gsteps, wo.get("description", ""))
                 wid = upload_workout(user_session["garmin"], payload, wo["scheduled_date"])
                 state["pending_workout"] = None
-                return {
-                    "status": "success",
-                    "message": (f"✅ **Caricato su Garmin!**\n\n"
-                                f"**{wo['name']}** è nel calendario per il **{wo['scheduled_date']}**. "
-                                f"Buon allenamento! 💪"),
-                    "action": "workout_uploaded",
-                    "workout_id": wid,
-                }
+                reply = (f"✅ **Caricato su Garmin!**\n\n"
+                         f"**{wo['name']}** è nel calendario per il **{wo['scheduled_date']}**. "
+                         f"Buon allenamento! 💪")
+                save_to_history(message, reply)
+                return {"status": "success", "message": reply,
+                        "action": "workout_uploaded", "workout_id": wid}
             except Exception as e:
                 state["pending_workout"] = None
                 raise HTTPException(500, f"Errore Garmin: {str(e)}")
@@ -823,38 +821,31 @@ async def chat(request: ChatMessage):
                     gsteps = steps_to_garmin(wo["steps"])
                     payload = make_payload(wo["name"], wo["sport"], gsteps, wo.get("description", ""))
                     wid = upload_workout(user_session["garmin"], payload, wo["scheduled_date"])
-                    uploaded.append({"name": wo["name"], "date": wo["scheduled_date"],
-                                     "workout_id": wid})
+                    uploaded.append({"name": wo["name"], "date": wo["scheduled_date"], "workout_id": wid})
                 except Exception as e:
                     failed.append({"name": wo["name"], "error": str(e)})
 
             state["pending_plan"] = None
-
-            lines = [f"✅ **Piano caricato su Garmin! {len(uploaded)}/{len(plan)} allenamenti**\n"]
+            lines = [f"✅ **Piano caricato! {len(uploaded)}/{len(plan)} allenamenti**\n"]
             for u in uploaded:
-                emoji = "✅"
-                lines.append(f"{emoji} {u['name']} — {u['date']}")
+                lines.append(f"✅ {u['name']} — {u['date']}")
             if failed:
                 lines.append(f"\n⚠️ Falliti ({len(failed)}):")
                 for f in failed:
                     lines.append(f"  ❌ {f['name']}: {f['error']}")
-            lines.append("\nTravi gli allenamenti sull'orologio e su Garmin Connect. In bocca al lupo! 🏊🚴🏃")
-
-            return {
-                "status": "success",
-                "message": "\n".join(lines),
-                "action": "plan_uploaded",
-                "uploaded": uploaded,
-                "failed": failed,
-            }
+            lines.append("\nTrovi gli allenamenti sull'orologio e su Garmin Connect. In bocca al lupo! 🏊🚴🏃")
+            reply = "\n".join(lines)
+            save_to_history(message, reply)
+            return {"status": "success", "message": reply,
+                    "action": "plan_uploaded", "uploaded": uploaded, "failed": failed}
 
     # ── ANNULLA ───────────────────────────────────────────────────────────────
     if intent == "cancel":
         state["pending_workout"] = None
         state["pending_plan"] = None
-        return {"status": "success",
-                "message": "❌ Annullato. Dimmi pure cosa vuoi fare!",
-                "action": "cancelled"}
+        reply = "❌ Annullato. Dimmi pure cosa vuoi fare!"
+        save_to_history(message, reply)
+        return {"status": "success", "message": reply, "action": "cancelled"}
 
     # ── MOSTRA DETTAGLI PIANO ─────────────────────────────────────────────────
     if intent == "show_details" and state.get("pending_plan"):
@@ -862,8 +853,10 @@ async def chat(request: ChatMessage):
         lines = [f"📋 **Dettagli del piano ({len(plan)} allenamenti):**\n"]
         for i, wo in enumerate(plan, 1):
             lines.append(f"\n**{i}.** {format_single_workout(wo, show_steps=True)}")
-        lines.append("\n---\nRispondi **Sì** per caricare tutto su Garmin, **No** per annullare.")
-        return {"status": "success", "message": "\n".join(lines),
+        lines.append("\n---\nRispondi **Sì** per caricare tutto, **No** per annullare.")
+        reply = "\n".join(lines)
+        save_to_history(message, reply)
+        return {"status": "success", "message": reply,
                 "action": "plan_details", "pending_plan": plan}
 
     # ── CAMBIA DATA ───────────────────────────────────────────────────────────
@@ -877,10 +870,53 @@ async def chat(request: ChatMessage):
         new_date = r.content[0].text.strip()
         state["pending_workout"]["scheduled_date"] = new_date
         preview = format_single_workout(state["pending_workout"])
-        return {"status": "success",
-                "message": (f"📅 Data aggiornata a **{new_date}**!\n\n{preview}\n\n"
-                            f"Rispondi **Sì** per confermare o **No** per annullare."),
+        reply = (f"📅 Data aggiornata a **{new_date}**!\n\n{preview}\n\n"
+                 f"Rispondi **Sì** per confermare o **No** per annullare.")
+        save_to_history(message, reply)
+        return {"status": "success", "message": reply,
                 "action": "date_changed", "pending_workout": state["pending_workout"]}
+
+    # Helper: salva nella history e tronca a 40 messaggi
+    def save_to_history(user_msg: str, assistant_msg: str):
+        state["history"].append({"role": "user", "content": user_msg})
+        state["history"].append({"role": "assistant", "content": assistant_msg})
+        if len(state["history"]) > 40:
+            # Tieni sempre il primo messaggio (contesto Garmin) + ultimi 38
+            state["history"] = state["history"][:2] + state["history"][-38:]
+
+    # Helper: costruisce i messaggi per Claude con tutta la history
+    def build_messages_with_history(current_user_msg: str) -> list:
+        """
+        Prima chiamata: [user: contesto+messaggio]
+        Chiamate successive: [user: contesto+msg1, assistant: reply1, user: msg2, ...]
+        Il contesto Garmin viene iniettato SOLO nel primo messaggio.
+        """
+        if not state["history"]:
+            # Prima volta: inietta il contesto nel messaggio
+            return [{"role": "user", "content": f"{base_ctx}\n\n{current_user_msg}"}]
+        else:
+            # History esistente: primo messaggio già ha il contesto,
+            # aggiungi il nuovo messaggio alla fine
+            messages = []
+            for i, h in enumerate(state["history"]):
+                if i == 0:
+                    # Primo messaggio utente: ha già il contesto
+                    messages.append({"role": h["role"], "content": h["content"]})
+                else:
+                    messages.append({"role": h["role"], "content": h["content"]})
+            # Aggiungi il messaggio corrente
+            messages.append({"role": "user", "content": current_user_msg})
+            return messages
+
+    SYSTEM = """Sei un coach esperto di triathlon che allena Alessandro.
+Hai accesso a tutti i suoi dati Garmin reali: attività passate, GPS, lap, cadenza, passo.
+Ricordi TUTTA la conversazione precedente e ci fai riferimento naturalmente.
+Rispondi SEMPRE in italiano. Sii specifico, motivante e coerente con quanto detto prima.
+
+Puoi fare tutto dalla chat:
+- Analizzare attività passate con dati reali
+- Creare workout singoli e caricarli su Garmin
+- Creare piani di allenamento multi-settimana"""
 
     # ── ANALISI ATTIVITÀ PASSATE ──────────────────────────────────────────────
     if intent == "analyze":
@@ -890,12 +926,13 @@ async def chat(request: ChatMessage):
                 user_session["attivita_raw"],
                 user_session["garmin"]
             )
+            save_to_history(message, analysis)
             return {"status": "success", "message": analysis, "action": "analysis"}
         except Exception as e:
-            return {"status": "success",
-                    "message": f"Ho avuto un problema nel scaricare i dati granulari: {e}. "
-                               f"Posso comunque analizzare i dati sommari che ho.",
-                    "action": "analysis_error"}
+            reply = (f"Ho avuto un problema nel scaricare i dati granulari ({e}). "
+                     f"Ti do l'analisi dai dati sommari che ho.")
+            save_to_history(message, reply)
+            return {"status": "success", "message": reply, "action": "analysis_error"}
 
     # ── CREA PIANO ALLENAMENTI ────────────────────────────────────────────────
     if intent == "create_plan":
@@ -903,18 +940,19 @@ async def chat(request: ChatMessage):
             plan = ai_generate_training_plan(client_ai, message, base_ctx, today)
             state["pending_plan"] = plan
             state["pending_workout"] = None
-
             preview = format_plan_preview(plan)
+            reply = f"Ho creato questo piano per te:\n\n{preview}"
+            save_to_history(message, reply)
             return {
                 "status": "success",
-                "message": f"Ho creato questo piano per te:\n\n{preview}",
+                "message": reply,
                 "action": "plan_preview",
                 "pending_plan": plan,
             }
         except Exception as e:
-            return {"status": "success",
-                    "message": "Scusa, riprova descrivendo meglio il piano che vuoi (quanti giorni, quali sport, ecc.)",
-                    "action": "error"}
+            reply = "Scusa, riprova descrivendo meglio il piano (quanti giorni, quali sport, ecc.)"
+            save_to_history(message, reply)
+            return {"status": "success", "message": reply, "action": "error"}
 
     # ── CREA SINGOLO WORKOUT ──────────────────────────────────────────────────
     if intent == "create_workout":
@@ -922,47 +960,44 @@ async def chat(request: ChatMessage):
             wo = ai_generate_single_workout(client_ai, message, base_ctx, tomorrow)
             state["pending_workout"] = wo
             state["pending_plan"] = None
-
             preview = format_single_workout(wo)
+            reply = (f"Ho creato questo workout:\n\n{preview}\n\n---\n"
+                     f"Vuoi che lo carico su Garmin per il **{wo['scheduled_date']}**?\n"
+                     f"**Sì** per confermare, **No** per annullare, "
+                     f"o dimmi una data diversa.")
+            save_to_history(message, reply)
             return {
                 "status": "success",
-                "message": (f"Ho creato questo workout:\n\n{preview}\n\n---\n"
-                            f"Vuoi che lo carico su Garmin per il **{wo['scheduled_date']}**?\n"
-                            f"**Sì** per confermare, **No** per annullare, "
-                            f"o dimmi una data diversa."),
+                "message": reply,
                 "action": "workout_preview",
                 "pending_workout": wo,
             }
         except Exception as e:
-            return {"status": "success",
-                    "message": "Scusa, riprova con più dettagli sull'allenamento.",
-                    "action": "error"}
+            reply = "Scusa, riprova con più dettagli sull'allenamento."
+            save_to_history(message, reply)
+            return {"status": "success", "message": reply, "action": "error"}
 
     # ── CHAT NORMALE ──────────────────────────────────────────────────────────
-    state["history"].append({"role": "user", "content": message})
-    if len(state["history"]) > 20:
-        state["history"] = state["history"][-20:]
-
-    messages_for_claude = [
-        {"role": "user", "content": f"{base_ctx}\n\n{state['history'][0]['content']}"}
-    ] + state["history"][1:]
+    messages_for_claude = build_messages_with_history(message)
 
     r = client_ai.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1500,
-        system="""Sei un coach esperto di triathlon che allena Alessandro.
-Hai accesso a tutti i suoi dati Garmin: attività passate, GPS, lap, cadenza, passo.
-Rispondi SEMPRE in italiano. Sii specifico e motivante.
-
-Puoi fare TUTTO dalla chat:
-- Analizzare attività passate: "analizza la mia ultima corsa"
-- Creare singoli allenamenti: "crea ripetute di nuoto per domani"
-- Creare piani settimanali: "crea un piano per questa settimana"
-""",
+        system=SYSTEM,
         messages=messages_for_claude,
     )
     reply = r.content[0].text
-    state["history"].append({"role": "assistant", "content": reply})
+
+    # Prima volta: salva il messaggio con il contesto già iniettato
+    if not state["history"]:
+        state["history"].append({
+            "role": "user",
+            "content": f"{base_ctx}\n\n{message}"
+        })
+        state["history"].append({"role": "assistant", "content": reply})
+    else:
+        save_to_history(message, reply)
+
     return {"status": "success", "message": reply, "action": "chat"}
 
 
