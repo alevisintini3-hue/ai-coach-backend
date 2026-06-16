@@ -183,7 +183,6 @@ html, body, [class*="css"], .stApp {
     font-size: 13px;
     line-height: 1.65;
     word-break: break-word;
-    white-space: pre-wrap;
 }
 /* Mobile: chat full width */
 @media (max-width: 768px) {
@@ -319,9 +318,10 @@ def sport_badge(sport: str) -> str:
 
 
 def clean_message(text: str) -> str:
-    """Rimuove emoji decorative dai messaggi del coach (non dai badge sport)."""
+    """Rimuove emoji, converte markdown in HTML per la visualizzazione nella chat."""
     import re
-    # Rimuove emoji comuni usati come titoli/decorazioni
+
+    # 1. Rimuovi emoji decorative
     emoji_pattern = re.compile(
         "["
         "\U0001F300-\U0001F5FF"
@@ -337,11 +337,33 @@ def clean_message(text: str) -> str:
         "\U000024C2-\U0001F251"
         "]+", flags=re.UNICODE
     )
-    cleaned = emoji_pattern.sub("", text)
-    # Rimuovi righe che erano solo emoji+spazio (diventano righe vuote doppie)
-    import re as re2
-    cleaned = re2.sub(r'\n{3,}', '\n\n', cleaned)
-    return cleaned.strip()
+    text = emoji_pattern.sub("", text)
+
+    # 2. Rimuovi righe vuote eccessive (max 1 riga vuota consecutiva)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = text.strip()
+
+    # 3. Converti markdown → HTML
+
+    # Grassetto **testo** → <strong>
+    text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+
+    # Corsivo *testo* → <em>  (solo singolo asterisco rimasto)
+    text = re.sub(r'\*(.+?)\*', r'<em>\1</em>', text)
+
+    # Titoli ### → testo più grande (non H tag enormi)
+    text = re.sub(r'^#{1,3}\s+(.+)$', r'<span style="font-weight:600;color:#f0f6fc;">\1</span>', text, flags=re.MULTILINE)
+
+    # Liste con - o • → righe con un punto
+    text = re.sub(r'^[-•]\s+(.+)$', r'&nbsp;&nbsp;— \1', text, flags=re.MULTILINE)
+
+    # Newline → <br>
+    text = text.replace('\n', '<br>')
+
+    # Rimuovi <br> doppi eccessivi
+    text = re.sub(r'(<br>){3,}', '<br><br>', text)
+
+    return text
 
 
 def render_workout_table(workouts: list):
@@ -607,12 +629,14 @@ def send_message(message: str):
     st.session_state.chat_history.append({"role": "user", "content": message})
     with st.spinner("Elaborando..."):
         try:
-            r = requests.post(
-                f"{API}/chat",
-                json={"message": message,
-                      "conversation_id": st.session_state.conversation_id},
-                timeout=90,
-            )
+            payload = {
+                "message": message,
+                "conversation_id": st.session_state.conversation_id,
+                # Rimanda sempre lo state pendente — sopravvive al restart Render
+                "pending_workout": st.session_state.pending_workout,
+                "pending_plan": st.session_state.pending_plan,
+            }
+            r = requests.post(f"{API}/chat", json=payload, timeout=90)
             data = r.json()
             reply = data.get("message", "Errore")
             action = data.get("action", "chat")
@@ -639,19 +663,26 @@ def send_message(message: str):
 def confirm_action(action_type: str):
     with st.spinner("Elaborando..."):
         try:
-            r = requests.post(
-                f"{API}/chat",
-                json={"message": action_type,
-                      "conversation_id": st.session_state.conversation_id},
-                timeout=90,
-            )
+            payload = {
+                "message": action_type,
+                "conversation_id": st.session_state.conversation_id,
+                # CRITICO: rimanda sempre lo stato pendente
+                # Senza questo, se Render si riavvia lo stato si perde
+                "pending_workout": st.session_state.pending_workout,
+                "pending_plan": st.session_state.pending_plan,
+            }
+            r = requests.post(f"{API}/chat", json=payload, timeout=90)
             data = r.json()
             reply = data.get("message", "")
             action = data.get("action", "")
 
             if action == "plan_uploading":
                 plan = data.get("pending_plan", [])
-                conv_id = data.get("conversation_id", "default")
+                # Fallback: usa il piano locale se il backend non lo ritorna
+                if not plan:
+                    plan = st.session_state.pending_plan or []
+                conv_id = data.get("conversation_id",
+                                   st.session_state.conversation_id)
                 _upload_plan_one_by_one(plan, conv_id)
             elif action in ("workout_uploaded", "cancelled"):
                 st.session_state.pending_workout = None

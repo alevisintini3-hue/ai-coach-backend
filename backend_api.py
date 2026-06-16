@@ -38,6 +38,10 @@ app.add_middleware(
 class ChatMessage(BaseModel):
     message: str
     conversation_id: Optional[str] = "default"
+    # Il frontend rimanda il pending state ad ogni chiamata
+    # Questo garantisce che funzioni anche dopo restart del server
+    pending_workout: Optional[dict] = None
+    pending_plan: Optional[List[dict]] = None
 
 class WorkoutStep(BaseModel):
     type: str
@@ -944,6 +948,14 @@ async def chat(request: ChatMessage):
     message = request.message.strip()
     today = date.today().isoformat()
     tomorrow = str(date.today() + timedelta(days=1))
+
+    # ── RIPRISTINA STATO DAL FRONTEND (sopravvive al restart del server) ──────
+    # Se il server si è riavviato e ha perso lo state in RAM,
+    # il frontend lo rimanda ad ogni chiamata di conferma
+    if request.pending_workout and not state.get("pending_workout"):
+        state["pending_workout"] = request.pending_workout
+    if request.pending_plan and not state.get("pending_plan"):
+        state["pending_plan"] = request.pending_plan
 
     client_ai = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
     base_ctx = build_base_context(user_session["metriche"], user_session["attivita_raw"])
