@@ -1153,79 +1153,50 @@ Se l'utente chiede di caricare qualcosa, rispondi che stai preparando l'allename
 # UPLOAD PIANO — UN WORKOUT ALLA VOLTA (evita timeout Render)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class UploadOneRequest(BaseModel):
-    workout_index: int
+class UploadWorkoutDirectRequest(BaseModel):
+    """Il frontend manda il workout completo — zero dipendenza dallo state del server."""
+    workout: dict          # il singolo workout con name, sport, scheduled_date, steps
     conversation_id: Optional[str] = "default"
-    # Il frontend passa il piano completo come fallback
-    # nel caso il server si sia riavviato e abbia perso lo state in RAM
-    plan: Optional[List[dict]] = None
 
 
 @app.post("/plan/upload-one")
-async def plan_upload_one(request: UploadOneRequest):
+async def plan_upload_one(request: UploadWorkoutDirectRequest):
     """
-    Carica UN solo workout del piano, uno alla volta.
-    Accetta il piano sia dallo state in RAM che dal body della request.
+    Carica UN singolo workout mandato direttamente nel body.
+    Non usa nessuno state in RAM — sopravvive a qualsiasi restart di Render.
+    Il frontend chiama questo endpoint in un loop, uno per workout.
     """
     global user_session
     if user_session is None:
         raise HTTPException(401, "Chiama /login prima")
 
-    conv_id = request.conversation_id or "default"
-    state = conversation_states.get(conv_id, {})
-
-    # Usa il piano dal body se lo state in RAM e vuoto (server riavviato)
-    plan = state.get("pending_plan") or request.plan or []
-
-    if not plan:
-        return {"status": "success", "done": True,
-                "message": "Piano completato."}
-
-    idx = request.workout_index
-
-    if idx >= len(plan):
-        state["pending_plan"] = None
-        return {"status": "success", "done": True,
-                "message": "Tutti gli allenamenti caricati su Garmin."}
-
-    wo = plan[idx]
+    wo = request.workout
 
     try:
         gsteps = steps_to_garmin(wo["steps"])
-        payload = make_payload(wo["name"], wo["sport"], gsteps, wo.get("description", ""))
+        payload = make_payload(
+            wo["name"],
+            wo["sport"],
+            gsteps,
+            wo.get("description", ""),
+        )
         wid = upload_workout(user_session["garmin"], payload, wo["scheduled_date"])
-        remaining = len(plan) - idx - 1
-
-        if remaining == 0:
-            state["pending_plan"] = None
-
-        sport_label = {
-            "running": "Corsa", "swimming": "Nuoto",
-            "cycling": "Ciclismo", "strength_training": "Palestra",
-        }.get(wo.get("sport", ""), wo.get("sport", ""))
 
         return {
             "status": "success",
-            "done": (remaining == 0),
-            "workout_index": idx,
-            "total": len(plan),
-            "remaining": remaining,
             "uploaded": {
                 "name": wo["name"],
                 "sport": wo["sport"],
                 "date": wo["scheduled_date"],
                 "workout_id": wid,
             },
-            "message": f"{wo['name']} — {wo['scheduled_date']}",
         }
 
     except Exception as e:
         return {
             "status": "error",
-            "done": False,
-            "workout_index": idx,
+            "name": wo.get("name", "?"),
             "error": str(e),
-            "message": f"Errore su {wo['name']}: {str(e)}",
         }
 
 

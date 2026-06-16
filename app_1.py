@@ -704,21 +704,26 @@ def confirm_action(action_type: str):
 
 
 def _upload_plan_one_by_one(plan: list, conv_id: str):
-    """Carica ogni workout uno alla volta con progress bar."""
+    """
+    Carica ogni workout uno alla volta.
+    Manda il workout COMPLETO nel body di ogni request —
+    zero dipendenza dallo state del server, funziona sempre.
+    """
     import time
     total = len(plan)
     uploaded = []
     failed = []
 
+    SPORT_LABELS = {
+        "running": "Corsa", "swimming": "Nuoto",
+        "cycling": "Ciclismo", "strength_training": "Palestra",
+    }
+
     progress_bar = st.progress(0)
     status_area = st.empty()
 
-    for idx in range(total):
-        wo = plan[idx]
-        sport_label = {
-            "running": "Corsa", "swimming": "Nuoto",
-            "cycling": "Ciclismo", "strength_training": "Palestra",
-        }.get(wo.get("sport", ""), wo.get("sport", ""))
+    for idx, wo in enumerate(plan):
+        sport_label = SPORT_LABELS.get(wo.get("sport", ""), wo.get("sport", ""))
 
         status_area.markdown(
             f'<div style="font-size:12px;color:#8b949e;padding:4px 0;">'
@@ -730,16 +735,14 @@ def _upload_plan_one_by_one(plan: list, conv_id: str):
         )
 
         try:
+            # Manda il workout direttamente nel body — niente state in RAM
             r = requests.post(
                 f"{API}/plan/upload-one",
-                json={
-                    "workout_index": idx,
-                    "conversation_id": conv_id,
-                    "plan": plan,   # passa il piano completo — fallback se server riavviato
-                },
+                json={"workout": wo, "conversation_id": conv_id},
                 timeout=30,
             )
             result = r.json()
+
             if result.get("status") == "success":
                 uploaded.append({
                     "name": wo["name"],
@@ -747,20 +750,30 @@ def _upload_plan_one_by_one(plan: list, conv_id: str):
                     "sport": wo.get("sport", ""),
                 })
                 progress_bar.progress((idx + 1) / total)
-                time.sleep(1)  # pausa — Garmin rifiuta richieste troppo rapide
+                time.sleep(1.5)   # pausa tra upload — Garmin blocca richieste troppo rapide
             else:
-                failed.append({"name": wo["name"],
-                               "error": result.get("error", "Errore sconosciuto")})
+                failed.append({
+                    "name": wo["name"],
+                    "error": result.get("error", "Errore sconosciuto"),
+                })
+
         except Exception as e:
             failed.append({"name": wo["name"], "error": str(e)})
 
     progress_bar.empty()
     status_area.empty()
 
-    lines = [f"Piano caricato: {len(uploaded)}/{total} allenamenti su Garmin\n"]
+    # Messaggio finale
+    if len(uploaded) == total and total > 0:
+        header = f"Piano caricato su Garmin: {total}/{total} allenamenti"
+    elif len(uploaded) > 0:
+        header = f"Piano parzialmente caricato: {len(uploaded)}/{total} allenamenti"
+    else:
+        header = f"Caricamento fallito: 0/{total} allenamenti"
+
+    lines = [header + "\n"]
     for u in uploaded:
-        sl = {"running": "Corsa", "swimming": "Nuoto",
-              "cycling": "Ciclismo", "strength_training": "Palestra"}.get(u.get("sport",""), "")
+        sl = SPORT_LABELS.get(u.get("sport", ""), "")
         lines.append(f"  {u['name']} — {u['date']}" + (f" ({sl})" if sl else ""))
     if failed:
         lines.append(f"\nErrori ({len(failed)}):")
@@ -769,6 +782,11 @@ def _upload_plan_one_by_one(plan: list, conv_id: str):
 
     st.session_state.pending_plan = None
     st.session_state.pending_workout = None
+    st.session_state.chat_history.append({
+        "role": "coach",
+        "content": "\n".join(lines),
+        "action": "plan_uploaded",
+    })
     st.session_state.chat_history.append({
         "role": "coach",
         "content": "\n".join(lines),
