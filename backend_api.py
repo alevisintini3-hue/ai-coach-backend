@@ -633,57 +633,61 @@ def format_plan_preview(plan: list) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def detect_intent(message: str, state: dict) -> str:
+    import re as _re
     msg = message.lower().strip()
     pending = state.get("pending_workout")
     pending_plan = state.get("pending_plan")
 
-    # Conferma esplicita — funziona SEMPRE se c'è un pending
     CONFIRM_WORDS = [
         "sì", "si", "yes", "ok", "confermo", "carica", "caricali",
         "carica tutto", "caricali sul garmin", "vai", "procedi",
         "perfetto", "ottimo", "certo", "sure", "fatto", "dai",
-        "mettili", "aggiungili", "salvali", "uploada", "upload",
-        "li voglio", "voglio caricarli",
+        "mettili", "aggiungili", "salvali", "li voglio",
     ]
-    CANCEL_WORDS = ["no", "annulla", "cancel", "stop", "lascia perdere",
-                    "non caricare", "elimina", "cancella"]
+    CANCEL_WORDS = [
+        "no", "annulla", "cancel", "stop", "lascia perdere",
+        "non caricare", "elimina", "cancella",
+    ]
 
     if pending or pending_plan:
         if any(w in msg for w in CONFIRM_WORDS):
             return "confirm"
         if any(w in msg for w in CANCEL_WORDS):
             return "cancel"
-        if "dettagli" in msg or "mostra" in msg or "vedi" in msg:
+        if any(w in msg for w in ["dettagli", "mostra", "vedi step"]):
             return "show_details"
         if any(w in msg for w in ["lunedì", "martedì", "mercoledì", "giovedì",
                                    "venerdì", "sabato", "domenica", "domani",
                                    "dopodomani", "2026", "prossimo"]):
             return "change_date"
 
-    # Se non c'è pending ma il messaggio sembra una conferma generica,
-    # controlla se possiamo trattarlo come confirm comunque
     if any(w in msg for w in ["caricali sul garmin", "carica sul garmin",
-                               "carica tutto sul garmin", "metti sul garmin",
-                               "caricali su garmin", "carica su garmin"]):
+                               "carica tutto sul garmin", "metti sul garmin"]):
         return "confirm"
 
-    # Piano allenamenti
-    if any(w in msg for w in ["piano", "settimana", "settimane", "più allenamenti",
-                               "programma", "schedule", "4 allenamenti", "5 allenamenti",
-                               "tutta la settimana", "settimane di", "mese di"]):
+    # Piano: numeri plurali + parola allenamento/sessione
+    if _re.search(r"\b[2-9]\b|\b1[0-9]\b", msg):
+        if any(w in msg for w in ["allenament", "session", "workout", "giorn"]):
+            return "create_plan"
+
+    if any(w in msg for w in [
+        "piano", "settimana", "settimane", "programma",
+        "prossimi giorni", "più allenamenti", "tutta la settimana", "mese",
+    ]):
         return "create_plan"
 
-    # Singolo workout
-    if any(w in msg for w in ["crea", "voglio fare", "metti", "aggiungi", "pianifica",
-                               "schedula", "allenamento", "workout", "sessione",
-                               "carica sul calendario"]):
+    if any(w in msg for w in [
+        "crea", "voglio fare", "metti", "aggiungi", "pianifica",
+        "schedula", "allenamento", "workout", "sessione",
+        "carica sul calendario",
+    ]):
         return "create_workout"
 
-    # Analisi attività passate
-    if any(w in msg for w in ["analizza", "analisi", "ultima", "ultimo", "recente",
-                               "come è andata", "come stà", "lap", "km per km",
-                               "cadenza", "passo", "gps", "corsa di", "nuoto di",
-                               "come sono andato", "performance", "dati"]):
+    if any(w in msg for w in [
+        "analizza", "analisi", "ultima", "ultimo", "recente",
+        "come è andata", "lap", "km per km", "cadenza", "passo",
+        "gps", "come sono andato", "performance", "dati",
+    ]):
         return "analyze"
 
     return "chat"

@@ -632,7 +632,6 @@ def send_message(message: str):
             payload = {
                 "message": message,
                 "conversation_id": st.session_state.conversation_id,
-                # Rimanda sempre lo state pendente — sopravvive al restart Render
                 "pending_workout": st.session_state.pending_workout,
                 "pending_plan": st.session_state.pending_plan,
             }
@@ -641,12 +640,16 @@ def send_message(message: str):
             reply = data.get("message", "Errore")
             action = data.get("action", "chat")
 
+            # Salva PRIMA lo state, poi aggiungi alla history
             if action == "workout_preview":
                 st.session_state.pending_workout = data.get("pending_workout")
                 st.session_state.pending_plan = None
             elif action == "plan_preview":
-                st.session_state.pending_plan = data.get("pending_plan")
-                st.session_state.pending_workout = None
+                # CRITICO: salva il piano nello state prima di qualsiasi rerun
+                plan = data.get("pending_plan")
+                if plan:
+                    st.session_state.pending_plan = plan
+                    st.session_state.pending_workout = None
             elif action in ("workout_uploaded", "plan_uploaded", "cancelled"):
                 st.session_state.pending_workout = None
                 st.session_state.pending_plan = None
