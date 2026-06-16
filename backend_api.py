@@ -1026,9 +1026,7 @@ Se l'utente chiede di caricare qualcosa, rispondi che stai preparando l'allename
             payload = make_payload(wo["name"], wo["sport"], gsteps, wo.get("description", ""))
             wid = upload_workout(user_session["garmin"], payload, wo["scheduled_date"])
             state["pending_workout"] = None
-            reply = (f"✅ **Caricato su Garmin!**\n\n"
-                     f"**{wo['name']}** è nel calendario per il **{wo['scheduled_date']}**. "
-                     f"Buon allenamento! 💪")
+            reply = f"{wo['name']} caricato su Garmin per il {wo['scheduled_date']}. Buon allenamento!"
             save_to_history(message, reply)
             return {"status": "success", "message": reply,
                     "action": "workout_uploaded", "workout_id": wid}
@@ -1036,10 +1034,11 @@ Se l'utente chiede di caricare qualcosa, rispondi che stai preparando l'allename
             state["pending_workout"] = None
             raise HTTPException(500, f"Errore Garmin: {str(e)}")
 
-    # ── CONFERMA PIANO — ritorna il piano, il frontend carica uno alla volta ──
+    # ── CONFERMA PIANO ────────────────────────────────────────────────────────
+    # Ritorna il piano completo al frontend che carica uno alla volta
     if intent == "confirm" and state.get("pending_plan"):
         plan = state["pending_plan"]
-        reply = f"⏳ Avvio caricamento di **{len(plan)} allenamenti** su Garmin..."
+        reply = f"Avvio caricamento di {len(plan)} allenamenti su Garmin..."
         save_to_history(message, reply)
         return {
             "status": "success",
@@ -1157,14 +1156,16 @@ Se l'utente chiede di caricare qualcosa, rispondi che stai preparando l'allename
 class UploadOneRequest(BaseModel):
     workout_index: int
     conversation_id: Optional[str] = "default"
+    # Il frontend passa il piano completo come fallback
+    # nel caso il server si sia riavviato e abbia perso lo state in RAM
+    plan: Optional[List[dict]] = None
 
 
 @app.post("/plan/upload-one")
 async def plan_upload_one(request: UploadOneRequest):
     """
-    Carica UN solo workout del piano pendente.
-    Il frontend chiama questo endpoint sequenzialmente per ogni workout.
-    Ogni chiamata dura ~2-5 secondi, ben sotto il timeout di Render (30s).
+    Carica UN solo workout del piano, uno alla volta.
+    Accetta il piano sia dallo state in RAM che dal body della request.
     """
     global user_session
     if user_session is None:
@@ -1172,23 +1173,22 @@ async def plan_upload_one(request: UploadOneRequest):
 
     conv_id = request.conversation_id or "default"
     state = conversation_states.get(conv_id, {})
-    plan = state.get("pending_plan", [])
+
+    # Usa il piano dal body se lo state in RAM e vuoto (server riavviato)
+    plan = state.get("pending_plan") or request.plan or []
 
     if not plan:
         return {"status": "success", "done": True,
-                "message": "✅ Piano completato!"}
+                "message": "Piano completato."}
 
     idx = request.workout_index
 
-    # Tutti caricati
     if idx >= len(plan):
         state["pending_plan"] = None
         return {"status": "success", "done": True,
-                "message": "✅ Tutti gli allenamenti caricati su Garmin!"}
+                "message": "Tutti gli allenamenti caricati su Garmin."}
 
     wo = plan[idx]
-    emoji = {"running": "🏃", "swimming": "🏊", "cycling": "🚴",
-             "strength_training": "🏋️"}.get(wo.get("sport", ""), "⚡")
 
     try:
         gsteps = steps_to_garmin(wo["steps"])
@@ -1198,6 +1198,11 @@ async def plan_upload_one(request: UploadOneRequest):
 
         if remaining == 0:
             state["pending_plan"] = None
+
+        sport_label = {
+            "running": "Corsa", "swimming": "Nuoto",
+            "cycling": "Ciclismo", "strength_training": "Palestra",
+        }.get(wo.get("sport", ""), wo.get("sport", ""))
 
         return {
             "status": "success",
@@ -1210,9 +1215,8 @@ async def plan_upload_one(request: UploadOneRequest):
                 "sport": wo["sport"],
                 "date": wo["scheduled_date"],
                 "workout_id": wid,
-                "emoji": emoji,
             },
-            "message": f"{emoji} **{wo['name']}** — {wo['scheduled_date']}",
+            "message": f"{wo['name']} — {wo['scheduled_date']}",
         }
 
     except Exception as e:
@@ -1221,7 +1225,7 @@ async def plan_upload_one(request: UploadOneRequest):
             "done": False,
             "workout_index": idx,
             "error": str(e),
-            "message": f"❌ Errore su {wo['name']}: {str(e)}",
+            "message": f"Errore su {wo['name']}: {str(e)}",
         }
 
 

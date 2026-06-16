@@ -661,13 +661,22 @@ def send_message(message: str):
 
 
 def confirm_action(action_type: str):
+    """
+    Per il piano: carica direttamente uno alla volta senza passare per /chat.
+    Per workout singolo e annulla: passa per /chat come prima.
+    """
+    if action_type == "carica_piano" and st.session_state.pending_plan:
+        _upload_plan_one_by_one(
+            st.session_state.pending_plan,
+            st.session_state.conversation_id
+        )
+        return
+
     with st.spinner("Elaborando..."):
         try:
             payload = {
                 "message": action_type,
                 "conversation_id": st.session_state.conversation_id,
-                # CRITICO: rimanda sempre lo stato pendente
-                # Senza questo, se Render si riavvia lo stato si perde
                 "pending_workout": st.session_state.pending_workout,
                 "pending_plan": st.session_state.pending_plan,
             }
@@ -676,20 +685,16 @@ def confirm_action(action_type: str):
             reply = data.get("message", "")
             action = data.get("action", "")
 
-            if action == "plan_uploading":
-                plan = data.get("pending_plan", [])
-                # Fallback: usa il piano locale se il backend non lo ritorna
-                if not plan:
-                    plan = st.session_state.pending_plan or []
-                conv_id = data.get("conversation_id",
-                                   st.session_state.conversation_id)
-                _upload_plan_one_by_one(plan, conv_id)
-            elif action in ("workout_uploaded", "cancelled"):
+            if action in ("workout_uploaded", "cancelled"):
                 st.session_state.pending_workout = None
                 st.session_state.pending_plan = None
                 st.session_state.chat_history.append(
                     {"role": "coach", "content": reply, "action": action}
                 )
+            elif action == "plan_uploading":
+                plan = data.get("pending_plan") or st.session_state.pending_plan or []
+                conv_id = data.get("conversation_id", st.session_state.conversation_id)
+                _upload_plan_one_by_one(plan, conv_id)
             else:
                 st.session_state.chat_history.append(
                     {"role": "coach", "content": reply, "action": action}
@@ -699,32 +704,53 @@ def confirm_action(action_type: str):
 
 
 def _upload_plan_one_by_one(plan: list, conv_id: str):
+    """Carica ogni workout uno alla volta con progress bar."""
+    import time
     total = len(plan)
     uploaded = []
     failed = []
+
     progress_bar = st.progress(0)
     status_area = st.empty()
 
     for idx in range(total):
         wo = plan[idx]
+        sport_label = {
+            "running": "Corsa", "swimming": "Nuoto",
+            "cycling": "Ciclismo", "strength_training": "Palestra",
+        }.get(wo.get("sport", ""), wo.get("sport", ""))
+
         status_area.markdown(
-            f'<div style="font-size:12px;color:#8b949e;">Caricamento {idx+1}/{total}: '
+            f'<div style="font-size:12px;color:#8b949e;padding:4px 0;">'
+            f'Caricamento {idx+1}/{total}: '
             f'<span style="color:#c9d1d9;font-weight:500;">{wo["name"]}</span>'
-            f' — {wo["scheduled_date"]}</div>',
+            f' &nbsp;·&nbsp; {sport_label} &nbsp;·&nbsp; {wo["scheduled_date"]}'
+            f'</div>',
             unsafe_allow_html=True
         )
+
         try:
             r = requests.post(
                 f"{API}/plan/upload-one",
-                json={"workout_index": idx, "conversation_id": conv_id},
+                json={
+                    "workout_index": idx,
+                    "conversation_id": conv_id,
+                    "plan": plan,   # passa il piano completo — fallback se server riavviato
+                },
                 timeout=30,
             )
             result = r.json()
             if result.get("status") == "success":
-                uploaded.append(result.get("uploaded", {}))
+                uploaded.append({
+                    "name": wo["name"],
+                    "date": wo["scheduled_date"],
+                    "sport": wo.get("sport", ""),
+                })
                 progress_bar.progress((idx + 1) / total)
+                time.sleep(1)  # pausa — Garmin rifiuta richieste troppo rapide
             else:
-                failed.append({"name": wo["name"], "error": result.get("error", "Errore")})
+                failed.append({"name": wo["name"],
+                               "error": result.get("error", "Errore sconosciuto")})
         except Exception as e:
             failed.append({"name": wo["name"], "error": str(e)})
 
@@ -733,7 +759,9 @@ def _upload_plan_one_by_one(plan: list, conv_id: str):
 
     lines = [f"Piano caricato: {len(uploaded)}/{total} allenamenti su Garmin\n"]
     for u in uploaded:
-        lines.append(f"  {u.get('name','')} — {u.get('date','')}")
+        sl = {"running": "Corsa", "swimming": "Nuoto",
+              "cycling": "Ciclismo", "strength_training": "Palestra"}.get(u.get("sport",""), "")
+        lines.append(f"  {u['name']} — {u['date']}" + (f" ({sl})" if sl else ""))
     if failed:
         lines.append(f"\nErrori ({len(failed)}):")
         for f in failed:
@@ -742,8 +770,12 @@ def _upload_plan_one_by_one(plan: list, conv_id: str):
     st.session_state.pending_plan = None
     st.session_state.pending_workout = None
     st.session_state.chat_history.append({
-        "role": "coach", "content": "\n".join(lines), "action": "plan_uploaded"
+        "role": "coach",
+        "content": "\n".join(lines),
+        "action": "plan_uploaded",
     })
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGINA: CHAT
@@ -789,7 +821,7 @@ if page == "Chat":
         with c1:
             if st.button("Carica tutto su Garmin", type="primary",
                          use_container_width=True, key="confirm_plan_top"):
-                confirm_action("carica tutto"); st.rerun()
+                confirm_action("carica_piano"); st.rerun()
         with c2:
             if st.button("Vedi dettagli", use_container_width=True, key="details_plan_top"):
                 send_message("dettagli"); st.rerun()
@@ -896,7 +928,7 @@ if page == "Chat":
                 with c1:
                     if st.button("Carica tutto su Garmin", type="primary",
                                  use_container_width=True, key=f"ci_pl_{idx}"):
-                        confirm_action("carica tutto"); st.rerun()
+                        confirm_action("carica_piano"); st.rerun()
                 with c2:
                     if st.button("Vedi dettagli", use_container_width=True, key=f"cd_pl_{idx}"):
                         send_message("dettagli"); st.rerun()
