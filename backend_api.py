@@ -121,6 +121,9 @@ def fetch_activities(garmin: Garmin) -> tuple:
             "calorie": calories if calories > 0 else None,
             "pace": pace_str,
             "garmin_id": str(a.get("activityId", "")),
+            # workoutId presente = l'attività e stata eseguita da un workout strutturato
+            "workout_id": str(a.get("workoutId")) if a.get("workoutId") else None,
+            "is_structured": bool(a.get("workoutId")),
         }
         attivita_raw.append(activity)
 
@@ -802,12 +805,165 @@ REGOLE:
     return json.loads(raw)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# WORKOUT STRUTTURATI: TARGET vs ESEGUITO
+# ─────────────────────────────────────────────────────────────────────────────
+
+def speed_target_to_pace(value_one, value_two):
+    """
+    Converte un target di velocità Garmin (m/s) in pace mm:ss/km.
+    Garmin salva i target di velocita in m/s. Ritorna (pace_min, pace_max) come stringhe.
+    """
+    def ms_to_pace(ms):
+        if not ms or ms <= 0:
+            return None
+        sec_km = 1000 / ms
+        return sec_to_pace(sec_km)
+
+    # value_one e value_two sono i limiti del range di velocita
+    p1 = ms_to_pace(value_one) if value_one else None
+    p2 = ms_to_pace(value_two) if value_two else None
+    return p1, p2
+
+
+def fetch_structured_workout(garmin: Garmin, workout_id: str) -> dict:
+    """
+    Scarica un workout strutturato pianificato con i suoi target (pace/HR per step).
+    Ritorna una struttura leggibile con gli step e i loro obiettivi.
+    """
+    try:
+        wo = garmin.get_workout_by_id(workout_id)
+        if not wo:
+            return None
+
+        result = {
+            "name": wo.get("workoutName", ""),
+            "sport": wo.get("sportType", {}).get("sportTypeKey", ""),
+            "steps": [],
+        }
+
+        segments = wo.get("workoutSegments", [])
+        for seg in segments:
+            for step in seg.get("workoutSteps", []):
+                parsed = _parse_target_step(step)
+                if parsed:
+                    if isinstance(parsed, list):
+                        result["steps"].extend(parsed)
+                    else:
+                        result["steps"].append(parsed)
+
+        return result
+
+    except Exception as e:
+        print(f"⚠️ fetch_structured_workout error: {e}")
+        return None
+
+
+def _parse_target_step(step: dict, repeat_prefix: str = "") -> any:
+    """Estrae il target da uno step del workout (ricorsivo per i repeat)."""
+    step_type = step.get("type", "")
+
+    # Repeat group → espandi
+    if step_type == "RepeatGroupDTO":
+        iterations = step.get("numberOfIterations", 1)
+        child_results = []
+        for child in step.get("workoutSteps", []):
+            parsed = _parse_target_step(child, repeat_prefix=f"{iterations}x ")
+            if parsed:
+                if isinstance(parsed, list):
+                    child_results.extend(parsed)
+                else:
+                    child_results.append(parsed)
+        return child_results
+
+    # Step eseguibile
+    step_type_key = step.get("stepType", {}).get("stepTypeKey", "")
+
+    # Durata/distanza obiettivo
+    end_cond = step.get("endCondition", {}).get("conditionTypeKey", "")
+    end_val = step.get("endConditionValue", 0)
+
+    target_desc = ""
+    if end_cond == "distance":
+        target_desc = f"{int(end_val)}m" if end_val < 1000 else f"{end_val/1000:.1f}km"
+    elif end_cond == "time":
+        m, s = divmod(int(end_val), 60)
+        target_desc = f"{m}:{s:02d}min" if m else f"{int(end_val)}s"
+    elif end_cond == "lap.button":
+        target_desc = "fino a lap"
+
+    # Target di pace/velocita
+    target_type = step.get("targetType", {})
+    target_type_key = target_type.get("workoutTargetTypeKey", "") if target_type else ""
+
+    pace_target = None
+    hr_target = None
+
+    if target_type_key in ("pace.zone", "speed.zone"):
+        v1 = step.get("targetValueOne")
+        v2 = step.get("targetValueTwo")
+        p1, p2 = speed_target_to_pace(v1, v2)
+        if p1 and p2:
+            # ordina (pace piu lento = numero piu grande)
+            pace_target = f"{p2}–{p1}"  # p2 e il limite veloce
+    elif target_type_key == "heart.rate.zone":
+        v1 = step.get("targetValueOne")
+        v2 = step.get("targetValueTwo")
+        if v1 and v2:
+            hr_target = f"{int(v1)}–{int(v2)}bpm"
+
+    return {
+        "tipo": step_type_key,
+        "obiettivo": f"{repeat_prefix}{target_desc}".strip(),
+        "pace_target": pace_target,
+        "hr_target": hr_target,
+        "descrizione": step.get("description", ""),
+    }
+
+
+def build_target_vs_executed_context(structured: dict, lap_data: list) -> str:
+    """
+    Costruisce il contesto di confronto TARGET (pianificato) vs ESEGUITO (lap reali).
+    Questo e il cuore del valore aggiunto: dice se l'atleta ha rispettato i target.
+    """
+    if not structured or not structured.get("steps"):
+        return ""
+
+    ctx = "\n=== CONFRONTO TARGET vs ESEGUITO ===\n"
+    ctx += f"Questo allenamento era STRUTTURATO: \"{structured['name']}\"\n"
+    ctx += "L'atleta lo ha selezionato dall'orologio e seguito.\n\n"
+
+    ctx += "TARGET PIANIFICATI:\n"
+    for i, s in enumerate(structured["steps"], 1):
+        line = f"  Step {i} [{s['tipo']}]: {s['obiettivo']}"
+        if s.get("pace_target"):
+            line += f" | pace target: {s['pace_target']}/km"
+        if s.get("hr_target"):
+            line += f" | FC target: {s['hr_target']}"
+        if s.get("descrizione"):
+            line += f" | {s['descrizione']}"
+        ctx += line + "\n"
+
+    ctx += "\nESEGUITO REALE (lap):\n"
+    for lap in lap_data:
+        ctx += (f"  Lap {lap['lap']}: {lap['distance_km']}km in {lap['duration_str']} "
+                f"| pace reale {lap['pace']} | FC {lap.get('fc_media','N/A')}bpm\n")
+
+    ctx += ("\nISTRUZIONE: confronta ogni step pianificato col pace/FC realmente eseguito. "
+            "Dì chiaramente se l'atleta e rimasto DENTRO o FUORI dal target, "
+            "di quanti secondi/km ha sbagliato, e se e andato troppo forte o troppo piano. "
+            "Questo e il dato piu importante dell'analisi.\n")
+
+    return ctx
+
+
 def ai_analyze_activity(client, message: str, context: str,
                         attivita_raw: list, garmin: Garmin) -> str:
     """
     Trova l'attività rilevante, scarica GPS + metriche punto per punto,
     e ritorna analisi completa con pace istantaneo, HR, elevazione,
     cadenza, performance condition.
+    Se l'attivita era strutturata, confronta target vs eseguito.
     """
     msg_lower = message.lower()
 
@@ -853,28 +1009,67 @@ def ai_analyze_activity(client, message: str, context: str,
         print(f"  ✓ {len(lap_data)} lap | {len(detailed_metrics)} metriche | {len(gps_points)} GPS")
 
     granular_ctx = build_granular_context(candidate, lap_data, detailed_metrics, gps_points)
-    full_ctx = context + granular_ctx
+
+    # ── CONFRONTO TARGET vs ESEGUITO (solo se allenamento strutturato) ────────
+    is_structured = candidate.get("is_structured")
+    structured_ctx = ""
+    workout_id = candidate.get("workout_id")
+
+    if is_structured and workout_id:
+        print(f"  🎯 Allenamento strutturato (workout {workout_id}) — confronto target")
+        structured = fetch_structured_workout(garmin, workout_id)
+        if structured:
+            structured_ctx = build_target_vs_executed_context(structured, lap_data)
+
+    full_ctx = context + granular_ctx + structured_ctx
+
+    # System prompt diverso a seconda del tipo di allenamento
+    if structured_ctx:
+        system = """Sei un coach esperto di triathlon che analizza i dati reali di Alessandro.
+Questo era un ALLENAMENTO STRUTTURATO: Alessandro aveva dei TARGET precisi di pace/FC.
+Il tuo compito principale e confrontare TARGET vs ESEGUITO step per step.
+Hai accesso a: target pianificati, pace reale, HR, cadenza, elevazione.
+Rispondi SEMPRE in italiano. Sii diretto con i numeri: di di quanti sec/km ha sbagliato.
+Non usare emoji decorative."""
+        question = (
+            f"{full_ctx}\n\n"
+            f"Richiesta: {message}\n\n"
+            f"Analizza in questo ordine:\n"
+            f"1. CONFRONTO TARGET vs ESEGUITO: per ogni fase dell'allenamento, "
+            f"l'atleta e rimasto nel target di pace? Di quanto ha sbagliato? "
+            f"E andato troppo forte o troppo piano?\n"
+            f"2. Gestione dello sforzo: ha tenuto il ritmo costante o e calato?\n"
+            f"3. HR: coerente con l'intensita richiesta?\n"
+            f"4. Cadenza media e % sotto 170spm\n"
+            f"5. Valutazione complessiva: ha eseguito bene l'allenamento? Voto sintetico.\n"
+            f"6. Cosa migliorare nella prossima sessione strutturata"
+        )
+    else:
+        system = """Sei un coach esperto di triathlon che analizza i dati reali di Alessandro.
+Questo era un allenamento LIBERO (corsa casuale, senza target preimpostati).
+Hai accesso a: pace istantaneo punto per punto, HR, elevazione, cadenza (spm),
+performance condition, split km per km.
+Rispondi SEMPRE in italiano. Sii specifico: cita i numeri esatti dai dati.
+Non usare emoji decorative."""
+        question = (
+            f"{full_ctx}\n\n"
+            f"Richiesta: {message}\n\n"
+            f"Questo e un allenamento libero, quindi confronta col la BASELINE di Alessandro "
+            f"(corsa 12km a 5:40/km). Analizza:\n"
+            f"1. Pace km per km — calo? negative split? come si confronta con la baseline?\n"
+            f"2. HR — trend, zone, picchi\n"
+            f"3. Elevazione — impatto sul ritmo\n"
+            f"4. Cadenza — media, % sotto 170spm\n"
+            f"5. Performance Condition — trend durante la sessione\n"
+            f"6. Punti di forza e cosa migliorare\n"
+            f"7. Confronto con sessioni precedenti"
+        )
 
     r = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=2000,
-        system="""Sei un coach esperto di triathlon che analizza i dati reali di Alessandro.
-Hai accesso a: pace istantaneo punto per punto, HR, elevazione, cadenza (spm),
-performance condition, split km per km.
-Rispondi SEMPRE in italiano. Struttura la risposta in sezioni con emoji.
-Sii specifico: cita i numeri esatti dai dati.""",
-        messages=[{"role": "user", "content": (
-            f"{full_ctx}\n\n"
-            f"Richiesta: {message}\n\n"
-            f"Analizza:\n"
-            f"1. 📊 Pace km per km — calo? negative split?\n"
-            f"2. ❤️ HR — trend, zone, picchi\n"
-            f"3. 📈 Elevazione — impatto sul ritmo\n"
-            f"4. 🦵 Cadenza — media, % sotto 170spm\n"
-            f"5. ⚡ Performance Condition — trend durante la sessione\n"
-            f"6. 🎯 Punti di forza e cosa migliorare\n"
-            f"7. 📅 Confronto con sessioni precedenti"
-        )}]
+        system=system,
+        messages=[{"role": "user", "content": question}]
     )
 
     return r.content[0].text
@@ -886,7 +1081,7 @@ Sii specifico: cita i numeri esatti dai dati.""",
 
 @app.get("/")
 async def root():
-    return {"status": "online", "version": "7.0.0"}
+    return {"status": "online", "version": "8.0.0"}
 
 
 @app.post("/login")

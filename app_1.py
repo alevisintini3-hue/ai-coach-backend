@@ -498,10 +498,16 @@ def render_activity_table(activities: list):
     rows = ""
     for att in activities:
         badge = sport_badge(att.get("sport", ""))
+        # Indicatore allenamento strutturato (con target)
+        struct = ""
+        if att.get("is_structured"):
+            struct = ('<span style="display:inline-block;margin-left:6px;padding:1px 5px;'
+                      'border-radius:3px;font-size:9px;font-weight:600;background:#1f3a5f;'
+                      'color:#79c0ff;">TARGET</span>')
         rows += f"""<tr>
             <td style="white-space:nowrap;color:#8b949e;">{att.get('data','')}</td>
             <td>{badge}</td>
-            <td style="font-weight:500;color:#f0f6fc;">{att.get('nome','')}</td>
+            <td style="font-weight:500;color:#f0f6fc;">{att.get('nome','')}{struct}</td>
             <td style="white-space:nowrap;">{att.get('distanza_km','—')} km</td>
             <td style="white-space:nowrap;">{att.get('durata_str','—')}</td>
             <td style="white-space:nowrap;">{att.get('pace','—')}</td>
@@ -1007,14 +1013,23 @@ elif page == "Attivita":
         render_activity_table(activities)
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown('<div style="font-size:13px;font-weight:600;color:#c9d1d9;margin-bottom:8px;">Analizza un\'attivita</div>', unsafe_allow_html=True)
-        options = {f"{a['data']} — {a['nome']} ({a['distanza_km']}km)": a for a in activities}
+        options = {f"{a['data']} — {a['nome']} ({a['distanza_km']}km)"
+                   + (" [TARGET]" if a.get("is_structured") else ""): a
+                   for a in activities}
         selected = st.selectbox("", list(options.keys()), label_visibility="collapsed")
         if st.button("Analizza con il Coach", type="primary"):
             att = options[selected]
-            q = (f"Analizza nel dettaglio questa attivita: {att['sport']} del {att['data']}, "
-                 f"nome: {att['nome']}, {att['distanza_km']}km in {att['durata_str']}, "
-                 f"FC {att['fc_media']}bpm, pace {att['pace']}. "
-                 f"Voglio vedere pace km per km, HR, elevazione, cadenza e performance condition.")
+            if att.get("is_structured"):
+                q = (f"Analizza questo allenamento strutturato: {att['sport']} del {att['data']}, "
+                     f"nome: {att['nome']}, {att['distanza_km']}km in {att['durata_str']}, "
+                     f"FC {att['fc_media']}bpm, pace {att['pace']}. "
+                     f"Avevo dei target precisi: confronta TARGET vs ESEGUITO e dimmi "
+                     f"se ho rispettato gli obiettivi di pace, di quanto ho sbagliato.")
+            else:
+                q = (f"Analizza nel dettaglio questa corsa libera: {att['sport']} del {att['data']}, "
+                     f"nome: {att['nome']}, {att['distanza_km']}km in {att['durata_str']}, "
+                     f"FC {att['fc_media']}bpm, pace {att['pace']}. "
+                     f"Confronta con la baseline e mostra pace km per km, HR, elevazione, cadenza.")
             send_message(q)
             st.success("Analisi avviata. Vai alla sezione Chat per vedere i risultati.")
     else:
