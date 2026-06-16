@@ -638,11 +638,15 @@ def detect_intent(message: str, state: dict) -> str:
     pending = state.get("pending_workout")
     pending_plan = state.get("pending_plan")
 
+    NUM_WORDS = ["due", "tre", "quattro", "cinque", "sei",
+                 "sette", "otto", "nove", "dieci"]
+
     CONFIRM_WORDS = [
         "sì", "si", "yes", "ok", "confermo", "carica", "caricali",
         "carica tutto", "caricali sul garmin", "vai", "procedi",
         "perfetto", "ottimo", "certo", "sure", "fatto", "dai",
         "mettili", "aggiungili", "salvali", "li voglio",
+        "tutti", "tutti e tre", "tutti e due", "tutte",
     ]
     CANCEL_WORDS = [
         "no", "annulla", "cancel", "stop", "lascia perdere",
@@ -665,24 +669,30 @@ def detect_intent(message: str, state: dict) -> str:
                                "carica tutto sul garmin", "metti sul garmin"]):
         return "confirm"
 
-    # Piano: numeri plurali + parola allenamento/sessione
-    if _re.search(r"\b[2-9]\b|\b1[0-9]\b", msg):
-        if any(w in msg for w in ["allenament", "session", "workout", "giorn"]):
-            return "create_plan"
-
-    if any(w in msg for w in [
-        "piano", "settimana", "settimane", "programma",
-        "prossimi giorni", "più allenamenti", "tutta la settimana", "mese",
-    ]):
+    # PIANO: numeri (cifre O parole) + plurale sport/giorni
+    has_num = (_re.search(r"\b[2-9]\b|\b1[0-9]\b", msg) is not None
+               or any(n in msg for n in NUM_WORDS))
+    if has_num and any(w in msg for w in ["allenament", "session", "workout",
+                                           "giorn", "cors", "nuot", "bici",
+                                           "ciclism", "palestr"]):
         return "create_plan"
 
     if any(w in msg for w in [
-        "crea", "voglio fare", "metti", "aggiungi", "pianifica",
-        "schedula", "allenamento", "workout", "sessione",
+        "piano", "settimana", "settimane", "programma",
+        "prossimi giorni", "prossimi tre", "prossimi 3", "prossimi 5",
+        "prossimi 7", "più allenamenti", "tutta la settimana", "mese",
+    ]):
+        return "create_plan"
+
+    # SINGOLO WORKOUT
+    if any(w in msg for w in [
+        "crea", "fammi", "fai", "voglio fare", "voglio", "metti", "aggiungi",
+        "pianifica", "schedula", "allenamento", "workout", "sessione",
         "carica sul calendario",
     ]):
         return "create_workout"
 
+    # ANALISI
     if any(w in msg for w in [
         "analizza", "analisi", "ultima", "ultimo", "recente",
         "come è andata", "lap", "km per km", "cadenza", "passo",
@@ -727,7 +737,14 @@ SOLO JSON."""
         model="claude-sonnet-4-6", max_tokens=1500,
         messages=[{"role": "user", "content": prompt}]
     )
-    raw = r.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+    raw = r.content[0].text.strip()
+    raw = raw.replace("```json", "").replace("```", "").strip()
+
+    import re as _re
+    match = _re.search(r'\{.*\}', raw, _re.DOTALL)
+    if match:
+        raw = match.group(0)
+
     return json.loads(raw)
 
 
@@ -773,7 +790,15 @@ REGOLE:
         model="claude-sonnet-4-6", max_tokens=4000,
         messages=[{"role": "user", "content": prompt}]
     )
-    raw = r.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+    raw = r.content[0].text.strip()
+    raw = raw.replace("```json", "").replace("```", "").strip()
+
+    # Estrai solo l'array JSON (dal primo [ all'ultimo ])
+    import re as _re
+    match = _re.search(r'\[.*\]', raw, _re.DOTALL)
+    if match:
+        raw = match.group(0)
+
     return json.loads(raw)
 
 
@@ -1015,10 +1040,12 @@ Quando crei sessioni di palestra, specifica sempre: esercizi, serie, ripetizioni
 Non usare emoji decorative nelle risposte.
 
 REGOLA CRITICA: Questa app e INTEGRATA con Garmin Connect.
-Il sistema carica automaticamente gli allenamenti su Garmin quando l'utente conferma.
+Il sistema carica automaticamente gli allenamenti su Garmin quando l'utente conferma con un PULSANTE.
 Non dire MAI frasi come "non posso caricare su Garmin" o "non ho accesso a Garmin".
-Il caricamento e gestito dal sistema in background — tu devi solo creare l'allenamento.
-Se l'utente chiede di caricare qualcosa, rispondi che stai preparando l'allenamento."""
+Non dire MAI "sto caricando" o "il sistema sta processando il caricamento": il caricamento
+avviene SOLO quando l'utente preme il pulsante di conferma, non quando scrivi tu.
+Non chiedere MAI "quali vuoi caricare?" o "tutti e tre?": ci pensa il sistema con i pulsanti.
+Tu devi solo descrivere gli allenamenti. Il resto e automatico."""
 
     intent = detect_intent(message, state)
 
