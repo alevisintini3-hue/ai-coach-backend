@@ -637,19 +637,35 @@ def detect_intent(message: str, state: dict) -> str:
     pending = state.get("pending_workout")
     pending_plan = state.get("pending_plan")
 
-    # Risposte a workout/piano pendente
+    # Conferma esplicita — funziona SEMPRE se c'è un pending
+    CONFIRM_WORDS = [
+        "sì", "si", "yes", "ok", "confermo", "carica", "caricali",
+        "carica tutto", "caricali sul garmin", "vai", "procedi",
+        "perfetto", "ottimo", "certo", "sure", "fatto", "dai",
+        "mettili", "aggiungili", "salvali", "uploada", "upload",
+        "li voglio", "voglio caricarli",
+    ]
+    CANCEL_WORDS = ["no", "annulla", "cancel", "stop", "lascia perdere",
+                    "non caricare", "elimina", "cancella"]
+
     if pending or pending_plan:
-        if any(w in msg for w in ["sì", "si", "yes", "ok", "confermo", "carica",
-                                   "vai", "procedi", "perfetto", "ottimo", "certo"]):
+        if any(w in msg for w in CONFIRM_WORDS):
             return "confirm"
-        if any(w in msg for w in ["no", "annulla", "cancel", "stop"]):
+        if any(w in msg for w in CANCEL_WORDS):
             return "cancel"
-        if "dettagli" in msg or "mostra" in msg:
+        if "dettagli" in msg or "mostra" in msg or "vedi" in msg:
             return "show_details"
         if any(w in msg for w in ["lunedì", "martedì", "mercoledì", "giovedì",
                                    "venerdì", "sabato", "domenica", "domani",
-                                   "dopodomani", "2026"]):
+                                   "dopodomani", "2026", "prossimo"]):
             return "change_date"
+
+    # Se non c'è pending ma il messaggio sembra una conferma generica,
+    # controlla se possiamo trattarlo come confirm comunque
+    if any(w in msg for w in ["caricali sul garmin", "carica sul garmin",
+                               "carica tutto sul garmin", "metti sul garmin",
+                               "caricali su garmin", "carica su garmin"]):
+        return "confirm"
 
     # Piano allenamenti
     if any(w in msg for w in ["piano", "settimana", "settimane", "più allenamenti",
@@ -949,13 +965,16 @@ async def chat(request: ChatMessage):
     today = date.today().isoformat()
     tomorrow = str(date.today() + timedelta(days=1))
 
-    # ── RIPRISTINA STATO DAL FRONTEND (sopravvive al restart del server) ──────
-    # Se il server si è riavviato e ha perso lo state in RAM,
-    # il frontend lo rimanda ad ogni chiamata di conferma
+    # ── RIPRISTINA STATO DAL FRONTEND PRIMA DI TUTTO ──────────────────────────
+    # Il frontend rimanda sempre pending_workout e pending_plan.
+    # Se il server Render si è riavviato e ha perso la RAM,
+    # questo garantisce che la conferma funzioni comunque.
     if request.pending_workout and not state.get("pending_workout"):
         state["pending_workout"] = request.pending_workout
+        print(f"[RESTORE] pending_workout ripristinato: {request.pending_workout.get('name')}")
     if request.pending_plan and not state.get("pending_plan"):
         state["pending_plan"] = request.pending_plan
+        print(f"[RESTORE] pending_plan ripristinato: {len(request.pending_plan)} workout")
 
     client_ai = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
     base_ctx = build_base_context(user_session["metriche"], user_session["attivita_raw"])
@@ -989,7 +1008,13 @@ La palestra e parte integrante del training da triatleta:
 - Mobilita e stretching: fondamentale per il recupero
 
 Quando crei sessioni di palestra, specifica sempre: esercizi, serie, ripetizioni, recupero.
-Non usare emoji decorative nelle risposte."""
+Non usare emoji decorative nelle risposte.
+
+REGOLA CRITICA: Questa app e INTEGRATA con Garmin Connect.
+Il sistema carica automaticamente gli allenamenti su Garmin quando l'utente conferma.
+Non dire MAI frasi come "non posso caricare su Garmin" o "non ho accesso a Garmin".
+Il caricamento e gestito dal sistema in background — tu devi solo creare l'allenamento.
+Se l'utente chiede di caricare qualcosa, rispondi che stai preparando l'allenamento."""
 
     intent = detect_intent(message, state)
 
