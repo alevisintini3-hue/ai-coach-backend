@@ -167,6 +167,7 @@ def fetch_lap_data(garmin: Garmin, activity_id: str) -> list:
                 "cadenza_passi_min": avg_cadence * 2 if avg_cadence else None,
                 "passo_cm": lap.get("avgStrideLength") or None,
                 "dislivello_m": lap.get("elevationGain") or None,
+                "performance_condition": lap.get("avgPowerRatio") or None,
             })
         return lap_data
     except Exception as e:
@@ -174,8 +175,93 @@ def fetch_lap_data(garmin: Garmin, activity_id: str) -> list:
         return []
 
 
-def fetch_gps_data(garmin: Garmin, activity_id: str, sample_every: int = 20) -> list:
-    """Scarica punti GPS di una attività."""
+def fetch_detailed_metrics(garmin: Garmin, activity_id: str) -> list:
+    """
+    Scarica le metriche dettagliate punto per punto dalla Garmin API:
+    pace istantaneo, HR, elevazione, cadenza, performance condition.
+    Campiona ogni 5 punti per avere ~1 punto ogni 200m circa.
+    """
+    try:
+        details = garmin.get_activity_details(activity_id, maxChartSize=2000)
+        metric_descriptors = details.get("metricDescriptors", [])
+        activity_detail_metrics = details.get("activityDetailMetrics", [])
+
+        # Mappa indice → tipo metrica
+        descriptor_map = {}
+        for desc in metric_descriptors:
+            key = desc.get("metricsType", "")
+            idx = desc.get("metricsIndex", -1)
+            descriptor_map[idx] = key
+
+        points = []
+        cumulative_distance = 0
+        prev_dist = 0
+
+        for i, entry in enumerate(activity_detail_metrics):
+            # Campiona ogni 5 punti per avere più dettaglio ma non troppi dati
+            if i % 5 != 0:
+                continue
+
+            metrics = entry.get("metrics", [])
+            raw = {}
+            for idx, val in enumerate(metrics):
+                metric_type = descriptor_map.get(idx, "")
+                if metric_type:
+                    raw[metric_type] = val
+
+            # Distanza cumulativa
+            dist_val = raw.get("sumDistance", 0) or raw.get("directDistance", 0) or 0
+            cumulative_distance = dist_val / 1000  # in km
+
+            # Velocità → pace istantaneo
+            speed = raw.get("directSpeed", 0) or raw.get("Speed", 0) or 0
+            if speed and speed > 0:
+                pace_sec = 1000 / speed
+                pace_str = sec_to_pace(pace_sec)
+            else:
+                pace_sec = None
+                pace_str = None
+
+            # Cadenza (cicli/min → passi/min)
+            cadence_raw = raw.get("directRunCadence", 0) or raw.get("directBikeCadence", 0) or 0
+            cadence_spm = cadence_raw * 2 if cadence_raw else None
+
+            # Heart Rate
+            hr = raw.get("directHeartRate", 0) or raw.get("heartRate", 0) or None
+
+            # Elevazione
+            elevation = raw.get("directElevation", None) or raw.get("Altitude", None)
+
+            # Performance condition (Garmin Running Power / VO2 proxy)
+            perf_condition = (
+                raw.get("directPerformanceCondition", None) or
+                raw.get("performanceCondition", None)
+            )
+
+            # Temperatura
+            temp = raw.get("directAirTemperature", None)
+
+            point = {
+                "km": round(cumulative_distance, 3),
+                "pace": pace_str,
+                "pace_sec_km": round(pace_sec, 1) if pace_sec else None,
+                "hr": int(hr) if hr else None,
+                "elevation_m": round(elevation, 1) if elevation is not None else None,
+                "cadence_spm": int(cadence_spm) if cadence_spm else None,
+                "performance_condition": perf_condition,
+                "temp_c": temp,
+            }
+            points.append(point)
+
+        return points
+
+    except Exception as e:
+        print(f"⚠️ Detailed metrics error: {e}")
+        return []
+
+
+def fetch_gps_data(garmin: Garmin, activity_id: str, sample_every: int = 5) -> list:
+    """Scarica punti GPS — campiona ogni 5 punti (più denso di prima)."""
     try:
         gpx_data = garmin.download_activity(
             activity_id, dl_fmt=garmin.ActivityDownloadFormat.GPX
@@ -217,7 +303,7 @@ def fetch_gps_data(garmin: Garmin, activity_id: str, sample_every: int = 20) -> 
                 "index": i,
                 "lat": lat,
                 "lon": lon,
-                "elevation_m": float(ele.text) if ele is not None else None,
+                "elevation_m": round(float(ele.text), 1) if ele is not None else None,
                 "time": time_el.text if time_el is not None else None,
                 "hr": int(hr_el.text) if hr_el is not None else None,
                 "cadence_spm": int(cad_el.text) * 2 if cad_el is not None else None,
@@ -231,38 +317,108 @@ def fetch_gps_data(garmin: Garmin, activity_id: str, sample_every: int = 20) -> 
         return []
 
 
-def build_granular_context(activity: dict, lap_data: list, gps_points: list) -> str:
-    """Costruisce il testo di analisi granulare per Claude."""
-    ctx = f"\n=== ANALISI DETTAGLIATA: {activity.get('nome', 'Attività')} ({activity.get('data')}) ===\n"
-    ctx += f"Sport: {activity.get('sport')} | Distanza: {activity.get('distanza_km')}km | "
-    ctx += f"Durata: {activity.get('durata_str')} | Pace medio: {activity.get('pace')} | "
-    ctx += f"FC media: {activity.get('fc_media')}bpm\n\n"
+def build_granular_context(activity: dict, lap_data: list,
+                           detailed_metrics: list, gps_points: list) -> str:
+    """
+    Costruisce il contesto analitico completo per Claude.
+    Include: lap, pace istantaneo punto per punto, HR, elevazione,
+    cadenza, performance condition.
+    """
+    ctx = f"\n=== ANALISI DETTAGLIATA ===\n"
+    ctx += f"Attività: {activity.get('nome')} | Data: {activity.get('data')}\n"
+    ctx += f"Sport: {activity.get('sport')} | Distanza: {activity.get('distanza_km')}km\n"
+    ctx += f"Durata: {activity.get('durata_str')} | Pace medio: {activity.get('pace')}\n"
+    ctx += f"FC media: {activity.get('fc_media')}bpm | FC max: {activity.get('fc_max')}bpm\n\n"
 
+    # ── LAP KM PER KM ─────────────────────────────────────────────────────────
     if lap_data:
-        ctx += "DATI KM PER KM:\n"
         paces = [l["pace_sec_km"] for l in lap_data if l["pace_sec_km"] > 0]
+        ctx += "SPLIT KM PER KM:\n"
         for lap in lap_data:
             ctx += (
-                f"  Km {lap['lap']}: {lap['pace']} | "
-                f"FC {lap['fc_media'] or 'N/A'}bpm | "
-                f"cadenza {lap['cadenza_passi_min'] or 'N/A'}spm | "
-                f"passo {lap['passo_cm'] or 'N/A'}cm\n"
+                f"  Km {lap['lap']:2d}: pace {lap['pace']:8s} | "
+                f"FC {str(lap['fc_media'] or 'N/A'):>6s}bpm | "
+                f"cad {str(lap['cadenza_passi_min'] or 'N/A'):>5s}spm | "
+                f"passo {str(lap['passo_cm'] or 'N/A'):>5s}cm | "
+                f"dislivello {str(lap.get('dislivello_m') or 'N/A'):>5s}m\n"
             )
         if paces:
             best = min(paces)
             worst = max(paces)
-            ctx += f"\nMiglior km: {sec_to_pace(best)} | Peggior km: {sec_to_pace(worst)} | "
-            ctx += f"Variazione: {int(worst - best)}sec/km\n"
+            avg = sum(paces) / len(paces)
+            ctx += f"\n  📊 Best km: {sec_to_pace(best)} | Worst km: {sec_to_pace(worst)} "
+            ctx += f"| Variazione: {int(worst-best)}sec/km\n"
+            # Rileva calo progressivo
+            if len(paces) >= 3:
+                first_half = paces[:len(paces)//2]
+                second_half = paces[len(paces)//2:]
+                avg_first = sum(first_half) / len(first_half)
+                avg_second = sum(second_half) / len(second_half)
+                delta = avg_second - avg_first
+                if delta > 10:
+                    ctx += f"  ⚠️ Calo di ritmo nella seconda metà: +{int(delta)}sec/km\n"
+                elif delta < -10:
+                    ctx += f"  ✅ Negative split! Accelerazione nella seconda metà: {int(abs(delta))}sec/km\n"
+        ctx += "\n"
 
-    if gps_points:
-        ctx += f"\nGPS: {len(gps_points)} punti campionati\n"
-        # Mostra ogni ~10% del percorso
-        step = max(1, len(gps_points) // 8)
-        for i in range(0, len(gps_points), step):
-            pt = gps_points[i]
+    # ── METRICHE PUNTO PER PUNTO ──────────────────────────────────────────────
+    if detailed_metrics:
+        ctx += f"DATI PUNTO PER PUNTO ({len(detailed_metrics)} campioni):\n"
+        ctx += f"{'km':>6} | {'pace':>8} | {'HR':>5} | {'ele':>5} | {'cad':>5} | {'PC':>5}\n"
+        ctx += f"{'─'*6}-+-{'─'*8}-+-{'─'*5}-+-{'─'*5}-+-{'─'*5}-+-{'─'*5}\n"
+
+        # Per non fare troppo testo, mostra ogni punto (già campionato ogni 5)
+        # ma limita a max 100 righe
+        step = max(1, len(detailed_metrics) // 100)
+        for pt in detailed_metrics[::step]:
             ctx += (
-                f"  @{pt['cumulative_km']}km: "
-                f"lat {pt['lat']:.4f} lon {pt['lon']:.4f}"
+                f"  {pt['km']:>5.2f} | "
+                f"{pt['pace'] or 'N/A':>8} | "
+                f"{str(pt['hr'] or ''):>5} | "
+                f"{str(pt['elevation_m'] or ''):>5} | "
+                f"{str(pt['cadence_spm'] or ''):>5} | "
+                f"{str(pt['performance_condition'] or ''):>5}\n"
+            )
+
+        # Statistiche derivate
+        hrs = [p["hr"] for p in detailed_metrics if p.get("hr")]
+        eles = [p["elevation_m"] for p in detailed_metrics if p.get("elevation_m")]
+        cads = [p["cadence_spm"] for p in detailed_metrics if p.get("cadence_spm")]
+        pcs = [p["performance_condition"] for p in detailed_metrics
+               if p.get("performance_condition")]
+        paces_inst = [p["pace_sec_km"] for p in detailed_metrics
+                      if p.get("pace_sec_km") and 180 < p["pace_sec_km"] < 900]
+
+        ctx += "\nSTATISTICHE DERIVATE:\n"
+        if hrs:
+            ctx += f"  HR: min {min(hrs)} | max {max(hrs)} | media {sum(hrs)//len(hrs)}bpm\n"
+        if eles:
+            ctx += f"  Elevazione: min {min(eles):.0f}m | max {max(eles):.0f}m | "
+            ctx += f"dislivello totale +{max(eles)-min(eles):.0f}m\n"
+        if cads:
+            ctx += f"  Cadenza: media {sum(cads)//len(cads)}spm | "
+            ctx += f"min {min(cads)} | max {max(cads)}spm\n"
+            under170 = sum(1 for c in cads if c < 170)
+            ctx += f"  Punti sotto 170spm (sotto-ottimale): {under170}/{len(cads)} "
+            ctx += f"({100*under170//len(cads)}%)\n"
+        if pcs:
+            ctx += f"  Performance Condition: media {sum(pcs)/len(pcs):.1f} | "
+            ctx += f"min {min(pcs):.1f} | max {max(pcs):.1f}\n"
+        if paces_inst:
+            ctx += f"  Pace istantaneo: min {sec_to_pace(min(paces_inst))} | "
+            ctx += f"max {sec_to_pace(max(paces_inst))}\n"
+
+        ctx += "\n"
+
+    # ── GPS ────────────────────────────────────────────────────────────────────
+    if gps_points:
+        ctx += f"GPS: {len(gps_points)} punti campionati\n"
+        # Solo ogni 20% del percorso per non appesantire troppo
+        step = max(1, len(gps_points) // 5)
+        for pt in gps_points[::step]:
+            ctx += (
+                f"  @{pt['cumulative_km']:.1f}km: "
+                f"lat {pt['lat']:.5f} lon {pt['lon']:.5f}"
                 f"{' ele:'+str(pt['elevation_m'])+'m' if pt.get('elevation_m') else ''}"
                 f"{' FC:'+str(pt['hr'])+'bpm' if pt.get('hr') else ''}\n"
             )
@@ -274,11 +430,18 @@ def build_granular_context(activity: dict, lap_data: list, gps_points: list) -> 
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_base_context(metriche_sport: dict, attivita_raw: list) -> str:
+    now = datetime.now()
+    day_ita = ["lunedì","martedì","mercoledì","giovedì","venerdì","sabato","domenica"]
+    month_ita = ["","gennaio","febbraio","marzo","aprile","maggio","giugno",
+                 "luglio","agosto","settembre","ottobre","novembre","dicembre"]
+
     ctx = "=== PROFILO ATLETA ===\n"
     ctx += "Nome: Alessandro | Paese: Germania\n"
     ctx += "Obiettivo: Triathlon olimpico\n"
     ctx += "Baseline: nuoto 2km/40min (2:00/100m), corsa 12km a 5:40/km\n"
-    ctx += f"Data oggi: {date.today().isoformat()} ({date.today().strftime('%A')})\n\n"
+    ctx += (f"Data e ora attuale: {day_ita[now.weekday()]} "
+            f"{now.day} {month_ita[now.month]} {now.year}, "
+            f"ore {now.strftime('%H:%M')}\n\n")
 
     ctx += "=== STORICO ALLENAMENTI ===\n\n"
     for sport, m in sorted(metriche_sport.items()):
@@ -593,77 +756,80 @@ REGOLE:
 def ai_analyze_activity(client, message: str, context: str,
                         attivita_raw: list, garmin: Garmin) -> str:
     """
-    Capisce quale attività analizzare, scarica i dati granulari
-    e ritorna l'analisi completa.
+    Trova l'attività rilevante, scarica GPS + metriche punto per punto,
+    e ritorna analisi completa con pace istantaneo, HR, elevazione,
+    cadenza, performance condition.
     """
-    # Trova l'attività più rilevante in base al messaggio
     msg_lower = message.lower()
 
-    # Cerca per sport o parola chiave
     candidate = None
-    for att in attivita_raw[:20]:  # ultimi 20
+    for att in attivita_raw[:30]:
         sport = att.get("sport", "")
         nome = att.get("nome", "").lower()
-        if ("ultima" in msg_lower or "recente" in msg_lower or "ultimo" in msg_lower):
-            candidate = attivita_raw[0]  # ultima in assoluto
+        if any(w in msg_lower for w in ["ultima", "recente", "ultimo", "last"]):
+            candidate = attivita_raw[0]
             break
-        if "corsa" in msg_lower and "running" in sport:
+        if any(w in msg_lower for w in ["corsa", "running", "run"]) and "running" in sport:
             candidate = att
             break
-        if "nuoto" in msg_lower and "swimming" in sport:
+        if any(w in msg_lower for w in ["nuoto", "swimming", "swim", "piscina"]) and "swimming" in sport:
             candidate = att
             break
-        if "bici" in msg_lower and "cycling" in sport:
+        if any(w in msg_lower for w in ["bici", "cycling", "bike", "ciclismo"]) and "cycling" in sport:
             candidate = att
             break
-        if "palestra" in msg_lower and "strength" in sport:
+        if any(w in msg_lower for w in ["palestra", "strength", "pesi", "gym"]) and "strength" in sport:
             candidate = att
             break
-        if any(word in nome for word in msg_lower.split()):
+        if any(word in nome for word in msg_lower.split() if len(word) > 3):
             candidate = att
             break
 
     if not candidate and attivita_raw:
-        candidate = attivita_raw[0]  # fallback: ultima attività
+        candidate = attivita_raw[0]
 
     if not candidate:
-        return "Non ho trovato attività da analizzare nel tuo storico Garmin."
+        return "Non ho trovato attività nel tuo storico Garmin."
 
-    # Scarica dati granulari
     activity_id = candidate.get("garmin_id", "")
     lap_data = []
+    detailed_metrics = []
     gps_points = []
 
     if activity_id:
-        print(f"📊 Scaricando dati granulari per {candidate['nome']} ({activity_id})...")
+        print(f"📊 Analisi: {candidate['nome']} ({activity_id})")
         lap_data = fetch_lap_data(garmin, activity_id)
-        gps_points = fetch_gps_data(garmin, activity_id)
+        detailed_metrics = fetch_detailed_metrics(garmin, activity_id)
+        gps_points = fetch_gps_data(garmin, activity_id, sample_every=10)
+        print(f"  ✓ {len(lap_data)} lap | {len(detailed_metrics)} metriche | {len(gps_points)} GPS")
 
-    # Costruisci contesto granulare
-    granular_ctx = build_granular_context(candidate, lap_data, gps_points)
+    granular_ctx = build_granular_context(candidate, lap_data, detailed_metrics, gps_points)
     full_ctx = context + granular_ctx
 
-    # Analisi con Claude
     r = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=2000,
         system="""Sei un coach esperto di triathlon che analizza i dati reali di Alessandro.
-Hai accesso a dati GPS, lap km per km, cadenza, passo, FC.
-Rispondi SEMPRE in italiano. Sii specifico con i numeri.
-Struttura la risposta in sezioni chiare.""",
+Hai accesso a: pace istantaneo punto per punto, HR, elevazione, cadenza (spm),
+performance condition, split km per km.
+Rispondi SEMPRE in italiano. Struttura la risposta in sezioni con emoji.
+Sii specifico: cita i numeri esatti dai dati.""",
         messages=[{"role": "user", "content": (
             f"{full_ctx}\n\n"
-            f"Domanda: {message}\n\n"
-            f"Analizza in dettaglio:\n"
-            f"1. Andamento del ritmo km per km (c'è stato un calo?)\n"
-            f"2. Cadenza e passo (ottimale per triathlon: 170-180 spm)\n"
-            f"3. FC nell'arco dell'attività\n"
-            f"4. Punti di forza e aree di miglioramento\n"
-            f"5. Confronto con le sessioni precedenti dello stesso sport"
+            f"Richiesta: {message}\n\n"
+            f"Analizza:\n"
+            f"1. 📊 Pace km per km — calo? negative split?\n"
+            f"2. ❤️ HR — trend, zone, picchi\n"
+            f"3. 📈 Elevazione — impatto sul ritmo\n"
+            f"4. 🦵 Cadenza — media, % sotto 170spm\n"
+            f"5. ⚡ Performance Condition — trend durante la sessione\n"
+            f"6. 🎯 Punti di forza e cosa migliorare\n"
+            f"7. 📅 Confronto con sessioni precedenti"
         )}]
     )
 
     return r.content[0].text
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENDPOINTS BASE
@@ -759,15 +925,9 @@ async def get_calendar(year: int = None, month: int = None):
 # CHAT — FA TUTTO
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @app.post("/chat")
 async def chat(request: ChatMessage):
-    """
-    Chat intelligente che gestisce:
-    - Analisi attività passate (GPS, lap, cadenza, passo)
-    - Creazione singolo workout con conferma
-    - Creazione piano allenamenti multi-workout con conferma
-    - Conversazione generale
-    """
     global user_session
     if user_session is None:
         raise HTTPException(401, "Chiama /login prima")
@@ -788,56 +948,58 @@ async def chat(request: ChatMessage):
     client_ai = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
     base_ctx = build_base_context(user_session["metriche"], user_session["attivita_raw"])
 
+    # ── HELPERS ───────────────────────────────────────────────────────────────
+
+    def save_to_history(user_msg: str, assistant_msg: str):
+        state["history"].append({"role": "user", "content": user_msg})
+        state["history"].append({"role": "assistant", "content": assistant_msg})
+        if len(state["history"]) > 40:
+            state["history"] = state["history"][:2] + state["history"][-38:]
+
+    def build_messages(current_user_msg: str) -> list:
+        if not state["history"]:
+            return [{"role": "user", "content": f"{base_ctx}\n\n{current_user_msg}"}]
+        messages = list(state["history"])
+        messages.append({"role": "user", "content": current_user_msg})
+        return messages
+
+    SYSTEM = """Sei un coach esperto di triathlon che allena Alessandro.
+Hai accesso a tutti i suoi dati Garmin reali: attività passate, GPS, lap, cadenza, passo.
+Ricordi TUTTA la conversazione precedente e ci fai riferimento naturalmente.
+Rispondi SEMPRE in italiano. Sii specifico, motivante e coerente con quanto detto prima."""
+
     intent = detect_intent(message, state)
 
-    # ── CONFERMA ──────────────────────────────────────────────────────────────
-    if intent == "confirm":
-
-        # Singolo workout
-        if state.get("pending_workout"):
-            wo = state["pending_workout"]
-            try:
-                gsteps = steps_to_garmin(wo["steps"])
-                payload = make_payload(wo["name"], wo["sport"], gsteps, wo.get("description", ""))
-                wid = upload_workout(user_session["garmin"], payload, wo["scheduled_date"])
-                state["pending_workout"] = None
-                reply = (f"✅ **Caricato su Garmin!**\n\n"
-                         f"**{wo['name']}** è nel calendario per il **{wo['scheduled_date']}**. "
-                         f"Buon allenamento! 💪")
-                save_to_history(message, reply)
-                return {"status": "success", "message": reply,
-                        "action": "workout_uploaded", "workout_id": wid}
-            except Exception as e:
-                state["pending_workout"] = None
-                raise HTTPException(500, f"Errore Garmin: {str(e)}")
-
-        # Piano completo
-        if state.get("pending_plan"):
-            plan = state["pending_plan"]
-            uploaded = []
-            failed = []
-            for wo in plan:
-                try:
-                    gsteps = steps_to_garmin(wo["steps"])
-                    payload = make_payload(wo["name"], wo["sport"], gsteps, wo.get("description", ""))
-                    wid = upload_workout(user_session["garmin"], payload, wo["scheduled_date"])
-                    uploaded.append({"name": wo["name"], "date": wo["scheduled_date"], "workout_id": wid})
-                except Exception as e:
-                    failed.append({"name": wo["name"], "error": str(e)})
-
-            state["pending_plan"] = None
-            lines = [f"✅ **Piano caricato! {len(uploaded)}/{len(plan)} allenamenti**\n"]
-            for u in uploaded:
-                lines.append(f"✅ {u['name']} — {u['date']}")
-            if failed:
-                lines.append(f"\n⚠️ Falliti ({len(failed)}):")
-                for f in failed:
-                    lines.append(f"  ❌ {f['name']}: {f['error']}")
-            lines.append("\nTrovi gli allenamenti sull'orologio e su Garmin Connect. In bocca al lupo! 🏊🚴🏃")
-            reply = "\n".join(lines)
+    # ── CONFERMA WORKOUT SINGOLO ──────────────────────────────────────────────
+    if intent == "confirm" and state.get("pending_workout"):
+        wo = state["pending_workout"]
+        try:
+            gsteps = steps_to_garmin(wo["steps"])
+            payload = make_payload(wo["name"], wo["sport"], gsteps, wo.get("description", ""))
+            wid = upload_workout(user_session["garmin"], payload, wo["scheduled_date"])
+            state["pending_workout"] = None
+            reply = (f"✅ **Caricato su Garmin!**\n\n"
+                     f"**{wo['name']}** è nel calendario per il **{wo['scheduled_date']}**. "
+                     f"Buon allenamento! 💪")
             save_to_history(message, reply)
             return {"status": "success", "message": reply,
-                    "action": "plan_uploaded", "uploaded": uploaded, "failed": failed}
+                    "action": "workout_uploaded", "workout_id": wid}
+        except Exception as e:
+            state["pending_workout"] = None
+            raise HTTPException(500, f"Errore Garmin: {str(e)}")
+
+    # ── CONFERMA PIANO — ritorna il piano, il frontend carica uno alla volta ──
+    if intent == "confirm" and state.get("pending_plan"):
+        plan = state["pending_plan"]
+        reply = f"⏳ Avvio caricamento di **{len(plan)} allenamenti** su Garmin..."
+        save_to_history(message, reply)
+        return {
+            "status": "success",
+            "message": reply,
+            "action": "plan_uploading",
+            "pending_plan": plan,
+            "conversation_id": conv_id,
+        }
 
     # ── ANNULLA ───────────────────────────────────────────────────────────────
     if intent == "cancel":
@@ -853,7 +1015,6 @@ async def chat(request: ChatMessage):
         lines = [f"📋 **Dettagli del piano ({len(plan)} allenamenti):**\n"]
         for i, wo in enumerate(plan, 1):
             lines.append(f"\n**{i}.** {format_single_workout(wo, show_steps=True)}")
-        lines.append("\n---\nRispondi **Sì** per caricare tutto, **No** per annullare.")
         reply = "\n".join(lines)
         save_to_history(message, reply)
         return {"status": "success", "message": reply,
@@ -864,77 +1025,32 @@ async def chat(request: ChatMessage):
         r = client_ai.messages.create(
             model="claude-sonnet-4-6", max_tokens=20,
             messages=[{"role": "user",
-                       "content": f"Oggi è {today}. L'utente scrive: \"{message}\". "
-                                  f"Estrai la data ISO YYYY-MM-DD. Solo la data."}]
+                       "content": f"Oggi è {today}. Utente scrive: \"{message}\". "
+                                  f"Estrai data ISO YYYY-MM-DD. Solo la data."}]
         )
         new_date = r.content[0].text.strip()
         state["pending_workout"]["scheduled_date"] = new_date
         preview = format_single_workout(state["pending_workout"])
-        reply = (f"📅 Data aggiornata a **{new_date}**!\n\n{preview}\n\n"
-                 f"Rispondi **Sì** per confermare o **No** per annullare.")
+        reply = f"📅 Data aggiornata a **{new_date}**!\n\n{preview}"
         save_to_history(message, reply)
         return {"status": "success", "message": reply,
                 "action": "date_changed", "pending_workout": state["pending_workout"]}
 
-    # Helper: salva nella history e tronca a 40 messaggi
-    def save_to_history(user_msg: str, assistant_msg: str):
-        state["history"].append({"role": "user", "content": user_msg})
-        state["history"].append({"role": "assistant", "content": assistant_msg})
-        if len(state["history"]) > 40:
-            # Tieni sempre il primo messaggio (contesto Garmin) + ultimi 38
-            state["history"] = state["history"][:2] + state["history"][-38:]
-
-    # Helper: costruisce i messaggi per Claude con tutta la history
-    def build_messages_with_history(current_user_msg: str) -> list:
-        """
-        Prima chiamata: [user: contesto+messaggio]
-        Chiamate successive: [user: contesto+msg1, assistant: reply1, user: msg2, ...]
-        Il contesto Garmin viene iniettato SOLO nel primo messaggio.
-        """
-        if not state["history"]:
-            # Prima volta: inietta il contesto nel messaggio
-            return [{"role": "user", "content": f"{base_ctx}\n\n{current_user_msg}"}]
-        else:
-            # History esistente: primo messaggio già ha il contesto,
-            # aggiungi il nuovo messaggio alla fine
-            messages = []
-            for i, h in enumerate(state["history"]):
-                if i == 0:
-                    # Primo messaggio utente: ha già il contesto
-                    messages.append({"role": h["role"], "content": h["content"]})
-                else:
-                    messages.append({"role": h["role"], "content": h["content"]})
-            # Aggiungi il messaggio corrente
-            messages.append({"role": "user", "content": current_user_msg})
-            return messages
-
-    SYSTEM = """Sei un coach esperto di triathlon che allena Alessandro.
-Hai accesso a tutti i suoi dati Garmin reali: attività passate, GPS, lap, cadenza, passo.
-Ricordi TUTTA la conversazione precedente e ci fai riferimento naturalmente.
-Rispondi SEMPRE in italiano. Sii specifico, motivante e coerente con quanto detto prima.
-
-Puoi fare tutto dalla chat:
-- Analizzare attività passate con dati reali
-- Creare workout singoli e caricarli su Garmin
-- Creare piani di allenamento multi-settimana"""
-
-    # ── ANALISI ATTIVITÀ PASSATE ──────────────────────────────────────────────
+    # ── ANALISI ───────────────────────────────────────────────────────────────
     if intent == "analyze":
         try:
             analysis = ai_analyze_activity(
                 client_ai, message, base_ctx,
-                user_session["attivita_raw"],
-                user_session["garmin"]
+                user_session["attivita_raw"], user_session["garmin"]
             )
             save_to_history(message, analysis)
             return {"status": "success", "message": analysis, "action": "analysis"}
         except Exception as e:
-            reply = (f"Ho avuto un problema nel scaricare i dati granulari ({e}). "
-                     f"Ti do l'analisi dai dati sommari che ho.")
+            reply = "Ho avuto un problema nel scaricare i dati granulari. Ti do l'analisi dai dati sommari."
             save_to_history(message, reply)
             return {"status": "success", "message": reply, "action": "analysis_error"}
 
-    # ── CREA PIANO ALLENAMENTI ────────────────────────────────────────────────
+    # ── CREA PIANO ────────────────────────────────────────────────────────────
     if intent == "create_plan":
         try:
             plan = ai_generate_training_plan(client_ai, message, base_ctx, today)
@@ -943,42 +1059,31 @@ Puoi fare tutto dalla chat:
             preview = format_plan_preview(plan)
             reply = f"Ho creato questo piano per te:\n\n{preview}"
             save_to_history(message, reply)
-            return {
-                "status": "success",
-                "message": reply,
-                "action": "plan_preview",
-                "pending_plan": plan,
-            }
+            return {"status": "success", "message": reply,
+                    "action": "plan_preview", "pending_plan": plan}
         except Exception as e:
-            reply = "Scusa, riprova descrivendo meglio il piano (quanti giorni, quali sport, ecc.)"
+            reply = "Scusa, riprova descrivendo il piano (quanti giorni, quali sport, ecc.)"
             save_to_history(message, reply)
             return {"status": "success", "message": reply, "action": "error"}
 
-    # ── CREA SINGOLO WORKOUT ──────────────────────────────────────────────────
+    # ── CREA WORKOUT SINGOLO ──────────────────────────────────────────────────
     if intent == "create_workout":
         try:
             wo = ai_generate_single_workout(client_ai, message, base_ctx, tomorrow)
             state["pending_workout"] = wo
             state["pending_plan"] = None
             preview = format_single_workout(wo)
-            reply = (f"Ho creato questo workout:\n\n{preview}\n\n---\n"
-                     f"Vuoi che lo carico su Garmin per il **{wo['scheduled_date']}**?\n"
-                     f"**Sì** per confermare, **No** per annullare, "
-                     f"o dimmi una data diversa.")
+            reply = f"Ho creato questo workout:\n\n{preview}"
             save_to_history(message, reply)
-            return {
-                "status": "success",
-                "message": reply,
-                "action": "workout_preview",
-                "pending_workout": wo,
-            }
+            return {"status": "success", "message": reply,
+                    "action": "workout_preview", "pending_workout": wo}
         except Exception as e:
             reply = "Scusa, riprova con più dettagli sull'allenamento."
             save_to_history(message, reply)
             return {"status": "success", "message": reply, "action": "error"}
 
     # ── CHAT NORMALE ──────────────────────────────────────────────────────────
-    messages_for_claude = build_messages_with_history(message)
+    messages_for_claude = build_messages(message)
 
     r = client_ai.messages.create(
         model="claude-sonnet-4-6",
@@ -988,17 +1093,97 @@ Puoi fare tutto dalla chat:
     )
     reply = r.content[0].text
 
-    # Prima volta: salva il messaggio con il contesto già iniettato
     if not state["history"]:
-        state["history"].append({
-            "role": "user",
-            "content": f"{base_ctx}\n\n{message}"
-        })
+        state["history"].append({"role": "user", "content": f"{base_ctx}\n\n{message}"})
         state["history"].append({"role": "assistant", "content": reply})
     else:
         save_to_history(message, reply)
 
     return {"status": "success", "message": reply, "action": "chat"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UPLOAD PIANO — UN WORKOUT ALLA VOLTA (evita timeout Render)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class UploadOneRequest(BaseModel):
+    workout_index: int
+    conversation_id: Optional[str] = "default"
+
+
+@app.post("/plan/upload-one")
+async def plan_upload_one(request: UploadOneRequest):
+    """
+    Carica UN solo workout del piano pendente.
+    Il frontend chiama questo endpoint sequenzialmente per ogni workout.
+    Ogni chiamata dura ~2-5 secondi, ben sotto il timeout di Render (30s).
+    """
+    global user_session
+    if user_session is None:
+        raise HTTPException(401, "Chiama /login prima")
+
+    conv_id = request.conversation_id or "default"
+    state = conversation_states.get(conv_id, {})
+    plan = state.get("pending_plan", [])
+
+    if not plan:
+        return {"status": "success", "done": True,
+                "message": "✅ Piano completato!"}
+
+    idx = request.workout_index
+
+    # Tutti caricati
+    if idx >= len(plan):
+        state["pending_plan"] = None
+        return {"status": "success", "done": True,
+                "message": "✅ Tutti gli allenamenti caricati su Garmin!"}
+
+    wo = plan[idx]
+    emoji = {"running": "🏃", "swimming": "🏊", "cycling": "🚴",
+             "strength_training": "🏋️"}.get(wo.get("sport", ""), "⚡")
+
+    try:
+        gsteps = steps_to_garmin(wo["steps"])
+        payload = make_payload(wo["name"], wo["sport"], gsteps, wo.get("description", ""))
+        wid = upload_workout(user_session["garmin"], payload, wo["scheduled_date"])
+        remaining = len(plan) - idx - 1
+
+        if remaining == 0:
+            state["pending_plan"] = None
+
+        return {
+            "status": "success",
+            "done": (remaining == 0),
+            "workout_index": idx,
+            "total": len(plan),
+            "remaining": remaining,
+            "uploaded": {
+                "name": wo["name"],
+                "sport": wo["sport"],
+                "date": wo["scheduled_date"],
+                "workout_id": wid,
+                "emoji": emoji,
+            },
+            "message": f"{emoji} **{wo['name']}** — {wo['scheduled_date']}",
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "done": False,
+            "workout_index": idx,
+            "error": str(e),
+            "message": f"❌ Errore su {wo['name']}: {str(e)}",
+        }
+
+
+@app.post("/plan/cancel")
+async def plan_cancel(request: ConfirmWorkoutRequest):
+    conv_id = request.conversation_id or "default"
+    state = conversation_states.get(conv_id, {})
+    state["pending_plan"] = None
+    state["pending_workout"] = None
+    return {"status": "success", "message": "Piano annullato."}
 
 
 @app.post("/workout/confirm")

@@ -158,8 +158,8 @@ def send_message(message: str):
 
 
 def confirm_action(action_type: str):
-    """Chiama direttamente il backend per conferma o annulla."""
-    with st.spinner("Caricando su Garmin..."):
+    """Chiama il backend per conferma o annulla."""
+    with st.spinner("Elaborando..."):
         try:
             r = requests.post(
                 f"{API}/chat",
@@ -171,15 +171,88 @@ def confirm_action(action_type: str):
             reply = data.get("message", "")
             action = data.get("action", "")
 
-            if action in ("workout_uploaded", "plan_uploaded", "cancelled"):
+            if action == "plan_uploading":
+                # Carica uno alla volta con progress bar
+                plan = data.get("pending_plan", [])
+                conv_id = data.get("conversation_id", "default")
+                _upload_plan_one_by_one(plan, conv_id)
+            elif action in ("workout_uploaded", "cancelled"):
                 st.session_state.pending_workout = None
                 st.session_state.pending_plan = None
+                st.session_state.chat_history.append({
+                    "role": "coach", "content": reply, "action": action
+                })
+            else:
+                st.session_state.chat_history.append({
+                    "role": "coach", "content": reply, "action": action
+                })
 
-            st.session_state.chat_history.append({
-                "role": "coach", "content": reply, "action": action
-            })
         except Exception as e:
             st.error(str(e))
+
+
+def _upload_plan_one_by_one(plan: list, conv_id: str):
+    """Carica ogni workout del piano uno alla volta, mostrando il progresso."""
+    total = len(plan)
+    uploaded = []
+    failed = []
+
+    progress_bar = st.progress(0, text=f"Caricamento piano: 0/{total}")
+    status_container = st.empty()
+
+    for idx in range(total):
+        wo = plan[idx]
+        emoji = {"running": "🏃", "swimming": "🏊", "cycling": "🚴",
+                 "strength_training": "🏋️"}.get(wo.get("sport", ""), "⚡")
+
+        status_container.info(
+            f"⏳ Caricando {idx+1}/{total}: {emoji} **{wo['name']}** — {wo['scheduled_date']}"
+        )
+
+        try:
+            r = requests.post(
+                f"{API}/plan/upload-one",
+                json={"workout_index": idx, "conversation_id": conv_id},
+                timeout=30,
+            )
+            result = r.json()
+
+            if result.get("status") == "success":
+                u = result.get("uploaded", {})
+                uploaded.append(u)
+                progress_bar.progress(
+                    (idx + 1) / total,
+                    text=f"Caricamento piano: {idx+1}/{total}"
+                )
+            else:
+                failed.append({"name": wo["name"], "error": result.get("error", "Errore")})
+
+        except Exception as e:
+            failed.append({"name": wo["name"], "error": str(e)})
+
+    # Costruisci messaggio finale
+    progress_bar.empty()
+    status_container.empty()
+
+    lines = [f"✅ **Piano caricato su Garmin! {len(uploaded)}/{total} allenamenti**\n"]
+    for u in uploaded:
+        e = u.get("emoji", "⚡")
+        lines.append(f"{e} {u.get('name')} — {u.get('date')}")
+    if failed:
+        lines.append(f"\n⚠️ Falliti ({len(failed)}):")
+        for f in failed:
+            lines.append(f"  ❌ {f['name']}: {f['error']}")
+    lines.append("\n🏊🚴🏃 Trovi tutto sull'orologio e su Garmin Connect. In bocca al lupo!")
+
+    final_reply = "\n".join(lines)
+
+    st.session_state.pending_plan = None
+    st.session_state.pending_workout = None
+    st.session_state.chat_history.append({
+        "role": "coach",
+        "content": final_reply,
+        "action": "plan_uploaded",
+    })
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGINA CHAT
