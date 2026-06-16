@@ -154,13 +154,23 @@ def fetch_lap_data(garmin: Garmin, activity_id: str) -> list:
     """Scarica dati lap/km per una singola attività."""
     try:
         splits = garmin.get_activity_splits(activity_id)
+
+        # Garmin a volte ritorna {"lapDTOs": [...]} invece di una lista diretta
+        if isinstance(splits, dict):
+            splits = splits.get("lapDTOs") or splits.get("splits") or []
+
+        if not splits:
+            print(f"⚠️ Nessun lap per {activity_id}")
+            return []
+
         lap_data = []
-        for lap in (splits or []):
+        for lap in splits:
             distance_m = lap.get("distance", 0) or 0
-            duration_sec = lap.get("duration", 0) or 0
-            avg_speed = lap.get("averageSpeed", 0) or 0
+            duration_sec = lap.get("duration", 0) or lap.get("movingDuration", 0) or 0
+            avg_speed = lap.get("averageSpeed", 0) or lap.get("avgSpeed", 0) or 0
             pace_sec_km = (1000 / avg_speed) if avg_speed > 0 else 0
-            avg_cadence = lap.get("averageRunCadence", 0) or 0
+            avg_cadence = (lap.get("averageRunCadence") or lap.get("avgRunCadence")
+                           or lap.get("averageBikeCadence") or 0)
 
             lap_data.append({
                 "lap": lap.get("lapIndex", len(lap_data) + 1),
@@ -168,60 +178,80 @@ def fetch_lap_data(garmin: Garmin, activity_id: str) -> list:
                 "duration_str": f"{int(duration_sec//60)}:{int(duration_sec%60):02d}",
                 "pace": sec_to_pace(pace_sec_km),
                 "pace_sec_km": round(pace_sec_km, 1),
-                "fc_media": lap.get("averageHR") or None,
+                "fc_media": lap.get("averageHR") or lap.get("avgHR") or None,
                 "fc_max": lap.get("maxHR") or None,
                 "cadenza_cicli": avg_cadence or None,
-                "cadenza_passi_min": avg_cadence * 2 if avg_cadence else None,
+                "cadenza_passi_min": int(avg_cadence * 2) if avg_cadence else None,
                 "passo_cm": lap.get("avgStrideLength") or None,
                 "dislivello_m": lap.get("elevationGain") or None,
-                "performance_condition": lap.get("avgPowerRatio") or None,
             })
+        print(f"  ✓ {len(lap_data)} lap scaricati")
         return lap_data
     except Exception as e:
-        print(f"⚠️ Lap error: {e}")
+        import traceback
+        print(f"⚠️ Lap error per {activity_id}: {e}")
+        print(traceback.format_exc())
         return []
 
 
 def fetch_detailed_metrics(garmin: Garmin, activity_id: str) -> list:
     """
-    Scarica le metriche dettagliate punto per punto dalla Garmin API:
-    pace istantaneo, HR, elevazione, cadenza, performance condition.
-    Campiona ogni 5 punti per avere ~1 punto ogni 200m circa.
+    Scarica le metriche dettagliate punto per punto dalla Garmin API.
+    Campiona per avere ~1 punto ogni minuto/200m.
+    Robusto ai diversi nomi di campo che Garmin usa.
     """
     try:
         details = garmin.get_activity_details(activity_id, maxChartSize=2000)
+
+        if not details:
+            print(f"⚠️ get_activity_details ha ritornato vuoto per {activity_id}")
+            return []
+
         metric_descriptors = details.get("metricDescriptors", [])
         activity_detail_metrics = details.get("activityDetailMetrics", [])
 
-        # Mappa indice → tipo metrica
+        print(f"  📈 Details: {len(activity_detail_metrics)} campioni, "
+              f"{len(metric_descriptors)} metriche disponibili")
+
+        if not activity_detail_metrics:
+            print(f"⚠️ Nessun activityDetailMetrics per {activity_id}")
+            return []
+
+        # Mappa indice → tipo metrica (i nomi sono tipo "directSpeed", "directHeartRate")
         descriptor_map = {}
         for desc in metric_descriptors:
-            key = desc.get("metricsType", "")
+            key = desc.get("key") or desc.get("metricsType", "")
             idx = desc.get("metricsIndex", -1)
             descriptor_map[idx] = key
 
-        points = []
-        cumulative_distance = 0
-        prev_dist = 0
+        # Log dei nomi metriche disponibili (utile per debug)
+        available_keys = list(descriptor_map.values())
+        print(f"  📊 Metriche: {', '.join(available_keys[:12])}")
 
+        total = len(activity_detail_metrics)
+        # Campiona per avere circa 60-80 punti totali (buon dettaglio, non troppo testo)
+        sample_rate = max(1, total // 70)
+
+        points = []
         for i, entry in enumerate(activity_detail_metrics):
-            # Campiona ogni 5 punti per avere più dettaglio ma non troppi dati
-            if i % 5 != 0:
+            if i % sample_rate != 0:
                 continue
 
             metrics = entry.get("metrics", [])
             raw = {}
             for idx, val in enumerate(metrics):
-                metric_type = descriptor_map.get(idx, "")
-                if metric_type:
-                    raw[metric_type] = val
+                key = descriptor_map.get(idx, "")
+                if key:
+                    raw[key] = val
 
-            # Distanza cumulativa
-            dist_val = raw.get("sumDistance", 0) or raw.get("directDistance", 0) or 0
-            cumulative_distance = dist_val / 1000  # in km
+            # Distanza cumulativa (prova diversi nomi)
+            dist_val = (raw.get("sumDistance") or raw.get("directDistance") or 0)
+            cumulative_km = dist_val / 1000 if dist_val else 0
 
-            # Velocità → pace istantaneo
-            speed = raw.get("directSpeed", 0) or raw.get("Speed", 0) or 0
+            # Velocità → pace (m/s)
+            speed = (raw.get("directSpeed") or raw.get("sumMovingDuration")
+                     or raw.get("directRunCadence") and 0 or 0)
+            speed = raw.get("directSpeed") or raw.get("weightedMeanSpeed") or 0
             if speed and speed > 0:
                 pace_sec = 1000 / speed
                 pace_str = sec_to_pace(pace_sec)
@@ -229,41 +259,43 @@ def fetch_detailed_metrics(garmin: Garmin, activity_id: str) -> list:
                 pace_sec = None
                 pace_str = None
 
-            # Cadenza (cicli/min → passi/min)
-            cadence_raw = raw.get("directRunCadence", 0) or raw.get("directBikeCadence", 0) or 0
-            cadence_spm = cadence_raw * 2 if cadence_raw else None
+            # Cadenza
+            cad = (raw.get("directRunCadence") or raw.get("directBikeCadence")
+                   or raw.get("directDoubleCadence") or 0)
+            cadence_spm = int(cad * 2) if cad and cad < 130 else (int(cad) if cad else None)
 
-            # Heart Rate
-            hr = raw.get("directHeartRate", 0) or raw.get("heartRate", 0) or None
+            # HR
+            hr = raw.get("directHeartRate") or raw.get("heartRate") or None
 
             # Elevazione
-            elevation = raw.get("directElevation", None) or raw.get("Altitude", None)
+            elevation = raw.get("directElevation")
+            if elevation is None:
+                elevation = raw.get("directAltitude")
 
-            # Performance condition (Garmin Running Power / VO2 proxy)
-            perf_condition = (
-                raw.get("directPerformanceCondition", None) or
-                raw.get("performanceCondition", None)
-            )
+            # Performance condition
+            perf = raw.get("directPerformanceCondition")
 
-            # Temperatura
-            temp = raw.get("directAirTemperature", None)
-
-            point = {
-                "km": round(cumulative_distance, 3),
+            points.append({
+                "km": round(cumulative_km, 3),
                 "pace": pace_str,
                 "pace_sec_km": round(pace_sec, 1) if pace_sec else None,
                 "hr": int(hr) if hr else None,
                 "elevation_m": round(elevation, 1) if elevation is not None else None,
-                "cadence_spm": int(cadence_spm) if cadence_spm else None,
-                "performance_condition": perf_condition,
-                "temp_c": temp,
-            }
-            points.append(point)
+                "cadence_spm": cadence_spm,
+                "performance_condition": perf,
+            })
+
+        # Conta quanti punti hanno dati utili
+        with_pace = sum(1 for p in points if p["pace"])
+        with_hr = sum(1 for p in points if p["hr"])
+        print(f"  ✓ {len(points)} punti campionati | {with_pace} con pace | {with_hr} con HR")
 
         return points
 
     except Exception as e:
-        print(f"⚠️ Detailed metrics error: {e}")
+        import traceback
+        print(f"⚠️ Detailed metrics error per {activity_id}: {e}")
+        print(traceback.format_exc())
         return []
 
 
@@ -967,29 +999,41 @@ def ai_analyze_activity(client, message: str, context: str,
     """
     msg_lower = message.lower()
 
-    candidate = None
-    for att in attivita_raw[:30]:
-        sport = att.get("sport", "")
-        nome = att.get("nome", "").lower()
-        if any(w in msg_lower for w in ["ultima", "recente", "ultimo", "last"]):
-            candidate = attivita_raw[0]
-            break
-        if any(w in msg_lower for w in ["corsa", "running", "run"]) and "running" in sport:
-            candidate = att
-            break
-        if any(w in msg_lower for w in ["nuoto", "swimming", "swim", "piscina"]) and "swimming" in sport:
-            candidate = att
-            break
-        if any(w in msg_lower for w in ["bici", "cycling", "bike", "ciclismo"]) and "cycling" in sport:
-            candidate = att
-            break
-        if any(w in msg_lower for w in ["palestra", "strength", "pesi", "gym"]) and "strength" in sport:
-            candidate = att
-            break
-        if any(word in nome for word in msg_lower.split() if len(word) > 3):
-            candidate = att
-            break
+    # Determina lo sport richiesto (se specificato)
+    sport_richiesto = None
+    if any(w in msg_lower for w in ["corsa", "running", "run", "corro", "corse"]):
+        sport_richiesto = "running"
+    elif any(w in msg_lower for w in ["nuoto", "swimming", "swim", "piscina", "nuotato"]):
+        sport_richiesto = "swimming"
+    elif any(w in msg_lower for w in ["bici", "cycling", "bike", "ciclismo", "pedalato"]):
+        sport_richiesto = "cycling"
+    elif any(w in msg_lower for w in ["palestra", "strength", "pesi", "gym"]):
+        sport_richiesto = "strength_training"
 
+    candidate = None
+
+    # 1. Se è specificato uno sport, prendi l'ULTIMA attività DI QUELLO SPORT
+    if sport_richiesto:
+        for att in attivita_raw:
+            if sport_richiesto in att.get("sport", ""):
+                candidate = att
+                break
+        if candidate:
+            print(f"🎯 Sport richiesto: {sport_richiesto} → {candidate['nome']} ({candidate['data']})")
+
+    # 2. Se chiede "ultima/recente" senza sport, prendi l'ultima in assoluto
+    if not candidate and any(w in msg_lower for w in ["ultima", "recente", "ultimo", "last"]):
+        candidate = attivita_raw[0] if attivita_raw else None
+
+    # 3. Match per nome attività
+    if not candidate:
+        for att in attivita_raw[:30]:
+            nome = att.get("nome", "").lower()
+            if any(word in nome for word in msg_lower.split() if len(word) > 3):
+                candidate = att
+                break
+
+    # 4. Fallback: ultima attività
     if not candidate and attivita_raw:
         candidate = attivita_raw[0]
 
@@ -1002,7 +1046,7 @@ def ai_analyze_activity(client, message: str, context: str,
     gps_points = []
 
     if activity_id:
-        print(f"📊 Analisi: {candidate['nome']} ({activity_id})")
+        print(f"📊 Analisi: {candidate['nome']} ({candidate['data']}, sport={candidate['sport']}, id={activity_id})")
         lap_data = fetch_lap_data(garmin, activity_id)
         detailed_metrics = fetch_detailed_metrics(garmin, activity_id)
         gps_points = fetch_gps_data(garmin, activity_id, sample_every=10)
@@ -1024,13 +1068,19 @@ def ai_analyze_activity(client, message: str, context: str,
     full_ctx = context + granular_ctx + structured_ctx
 
     # System prompt diverso a seconda del tipo di allenamento
+    ANTI_DISCLAIMER = """
+IMPORTANTE: Usa i dati che trovi nel contesto. NON scrivere lunghi elenchi di
+"cosa non ho accesso" o "problema con i dati". Se un dato specifico manca,
+ignoralo silenziosamente e analizza con quello che hai. Vai dritto all'analisi utile.
+Non dire mai "ho accesso solo ai dati aggregati": analizza i dati granulari presenti."""
+
     if structured_ctx:
         system = """Sei un coach esperto di triathlon che analizza i dati reali di Alessandro.
 Questo era un ALLENAMENTO STRUTTURATO: Alessandro aveva dei TARGET precisi di pace/FC.
 Il tuo compito principale e confrontare TARGET vs ESEGUITO step per step.
 Hai accesso a: target pianificati, pace reale, HR, cadenza, elevazione.
 Rispondi SEMPRE in italiano. Sii diretto con i numeri: di di quanti sec/km ha sbagliato.
-Non usare emoji decorative."""
+Non usare emoji decorative.""" + ANTI_DISCLAIMER
         question = (
             f"{full_ctx}\n\n"
             f"Richiesta: {message}\n\n"
@@ -1050,7 +1100,7 @@ Questo era un allenamento LIBERO (corsa casuale, senza target preimpostati).
 Hai accesso a: pace istantaneo punto per punto, HR, elevazione, cadenza (spm),
 performance condition, split km per km.
 Rispondi SEMPRE in italiano. Sii specifico: cita i numeri esatti dai dati.
-Non usare emoji decorative."""
+Non usare emoji decorative.""" + ANTI_DISCLAIMER
         question = (
             f"{full_ctx}\n\n"
             f"Richiesta: {message}\n\n"
@@ -1126,6 +1176,49 @@ async def get_activities(sport: Optional[str] = Query(None), limit: int = Query(
     if sport:
         attivita = [a for a in attivita if a["sport"].lower() == sport.lower()]
     return {"total": len(attivita[:limit]), "activities": attivita[:limit]}
+
+
+@app.get("/debug/activity/{activity_id}")
+async def debug_activity(activity_id: str):
+    """
+    Endpoint diagnostico: mostra cosa ritorna Garmin per una specifica attivita.
+    Utile per capire perche i dati granulari non arrivano.
+    """
+    global user_session
+    if user_session is None:
+        raise HTTPException(401, "Chiama /login prima")
+
+    garmin = user_session["garmin"]
+    result = {"activity_id": activity_id}
+
+    # Test lap data
+    try:
+        lap = fetch_lap_data(garmin, activity_id)
+        result["lap_count"] = len(lap)
+        result["lap_sample"] = lap[:3]
+    except Exception as e:
+        result["lap_error"] = str(e)
+
+    # Test detailed metrics
+    try:
+        metrics = fetch_detailed_metrics(garmin, activity_id)
+        result["metrics_count"] = len(metrics)
+        result["metrics_sample"] = metrics[:5]
+    except Exception as e:
+        result["metrics_error"] = str(e)
+
+    # Test raw details (nomi dei campi disponibili)
+    try:
+        details = garmin.get_activity_details(activity_id, maxChartSize=100)
+        descriptors = details.get("metricDescriptors", [])
+        result["available_metrics"] = [
+            d.get("key") or d.get("metricsType") for d in descriptors
+        ]
+        result["total_samples_available"] = len(details.get("activityDetailMetrics", []))
+    except Exception as e:
+        result["details_error"] = str(e)
+
+    return result
 
 
 @app.get("/sync")
