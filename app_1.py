@@ -121,7 +121,7 @@ def send_message(message: str):
     """Invia messaggio al backend e aggiorna lo stato."""
     st.session_state.chat_history.append({"role": "user", "content": message})
 
-    with st.spinner("Coach sta pensando..."):
+    with st.spinner("Coach sta elaborando..."):
         try:
             r = requests.post(
                 f"{API}/chat",
@@ -133,7 +133,6 @@ def send_message(message: str):
             reply = data.get("message", "Errore")
             action = data.get("action", "chat")
 
-            # Aggiorna pending state
             if action == "workout_preview":
                 st.session_state.pending_workout = data.get("pending_workout")
                 st.session_state.pending_plan = None
@@ -157,6 +156,31 @@ def send_message(message: str):
                 "action": "error",
             })
 
+
+def confirm_action(action_type: str):
+    """Chiama direttamente il backend per conferma o annulla."""
+    with st.spinner("Caricando su Garmin..."):
+        try:
+            r = requests.post(
+                f"{API}/chat",
+                json={"message": action_type,
+                      "conversation_id": st.session_state.conversation_id},
+                timeout=90,
+            )
+            data = r.json()
+            reply = data.get("message", "")
+            action = data.get("action", "")
+
+            if action in ("workout_uploaded", "plan_uploaded", "cancelled"):
+                st.session_state.pending_workout = None
+                st.session_state.pending_plan = None
+
+            st.session_state.chat_history.append({
+                "role": "coach", "content": reply, "action": action
+            })
+        except Exception as e:
+            st.error(str(e))
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGINA CHAT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -164,157 +188,170 @@ def send_message(message: str):
 if page == "💬 Chat":
     st.subheader("💬 Parla con il tuo Coach")
 
-    # ── Banner workout pendente ────────────────────────────────────────────────
+    # ── Banner workout pendente — SEMPRE BOTTONI, MAI TESTO ──────────────────
     if st.session_state.pending_workout:
         wo = st.session_state.pending_workout
+        emoji = SPORT_EMOJI.get(wo.get("sport", ""), "⚡")
         with st.container(border=True):
-            emoji = SPORT_EMOJI.get(wo.get("sport", ""), "⚡")
             st.markdown(
-                f"⏳ **In attesa di conferma:** {emoji} **{wo.get('name')}** "
-                f"— {wo.get('scheduled_date')}"
+                f"### ⏳ Workout pronto per essere caricato\n"
+                f"{emoji} **{wo.get('name')}** — 📅 {wo.get('scheduled_date')} "
+                f"| 🏋️ {SPORT_LABEL.get(wo.get('sport',''), wo.get('sport',''))}"
             )
             c1, c2 = st.columns(2)
             with c1:
-                if st.button("✅ Sì, carica su Garmin!", type="primary",
-                             use_container_width=True, key="confirm_wo_banner"):
-                    send_message("Sì, confermo")
+                if st.button("✅ CARICA SU GARMIN", type="primary",
+                             use_container_width=True, key="confirm_wo_top"):
+                    confirm_action("confermo")
                     st.rerun()
             with c2:
-                if st.button("❌ Annulla", use_container_width=True, key="cancel_wo_banner"):
-                    send_message("No, annulla")
+                if st.button("❌ Annulla", use_container_width=True, key="cancel_wo_top"):
+                    confirm_action("annulla")
                     st.rerun()
 
-    # ── Banner piano pendente ──────────────────────────────────────────────────
+    # ── Banner piano pendente ─────────────────────────────────────────────────
     if st.session_state.pending_plan:
         plan = st.session_state.pending_plan
+        sports_in_plan = list({w.get("sport","") for w in plan})
+        sport_emojis = " ".join(SPORT_EMOJI.get(s,"⚡") for s in sports_in_plan)
         with st.container(border=True):
-            st.markdown(f"⏳ **Piano in attesa di conferma:** {len(plan)} allenamenti")
+            st.markdown(
+                f"### ⏳ Piano pronto per essere caricato\n"
+                f"{sport_emojis} **{len(plan)} allenamenti** pronti per Garmin Connect"
+            )
             c1, c2, c3 = st.columns(3)
             with c1:
-                if st.button("✅ Carica tutto su Garmin!", type="primary",
-                             use_container_width=True, key="confirm_plan_banner"):
-                    send_message("Sì, carica tutto")
+                if st.button("✅ CARICA TUTTO SU GARMIN", type="primary",
+                             use_container_width=True, key="confirm_plan_top"):
+                    confirm_action("carica tutto")
                     st.rerun()
             with c2:
-                if st.button("🔍 Vedi dettagli", use_container_width=True,
-                             key="details_plan_banner"):
+                if st.button("🔍 Vedi dettagli step", use_container_width=True,
+                             key="details_plan_top"):
                     send_message("dettagli")
                     st.rerun()
             with c3:
-                if st.button("❌ Annulla", use_container_width=True, key="cancel_plan_banner"):
-                    send_message("No, annulla")
+                if st.button("❌ Annulla piano", use_container_width=True,
+                             key="cancel_plan_top"):
+                    confirm_action("annulla")
                     st.rerun()
 
     st.divider()
 
-    # ── Domande rapide ────────────────────────────────────────────────────────
-    st.markdown("**⚡ Comandi rapidi:**")
+    # ── Comandi rapidi ────────────────────────────────────────────────────────
+    with st.expander("⚡ Comandi rapidi", expanded=False):
+        tab1, tab2, tab3 = st.tabs(["📊 Analisi", "🏋️ Workout", "📅 Piani"])
 
-    tab1, tab2, tab3 = st.tabs(["📊 Analisi", "🏋️ Workout", "📅 Piani"])
+        with tab1:
+            cols = st.columns(2)
+            for i, q in enumerate([
+                "Analizza la mia ultima corsa",
+                "Analizza il mio ultimo nuoto",
+                "Dati lap, cadenza e HR ultima corsa",
+                "Come stanno le mie performance?",
+                "Sono in sovrallenamento?",
+                "Confronta le mie ultime corse",
+            ]):
+                with cols[i % 2]:
+                    if st.button(q, use_container_width=True, key=f"qa_{i}"):
+                        send_message(q)
+                        st.rerun()
 
-    with tab1:
-        cols = st.columns(2)
-        analisi_quick = [
-            "Analizza la mia ultima corsa",
-            "Analizza il mio ultimo nuoto",
-            "Dati lap e cadenza ultima attività",
-            "Come stanno le mie performance?",
-            "Sono in sovrallenamento?",
-            "Confronta le mie ultime corse",
-        ]
-        for i, q in enumerate(analisi_quick):
-            with cols[i % 2]:
-                if st.button(q, use_container_width=True, key=f"qa_{i}"):
-                    send_message(q)
-                    st.rerun()
+        with tab2:
+            cols = st.columns(2)
+            for i, q in enumerate([
+                "Crea ripetute di corsa per domani",
+                "Crea sessione nuoto per dopodomani",
+                "Crea allenamento bici per giovedì",
+                "Crea sessione palestra per oggi",
+                "Crea un lungo di corsa per domenica",
+                "Crea interval training nuoto",
+            ]):
+                with cols[i % 2]:
+                    if st.button(q, use_container_width=True, key=f"qw_{i}"):
+                        send_message(q)
+                        st.rerun()
 
-    with tab2:
-        cols = st.columns(2)
-        workout_quick = [
-            "Crea ripetute di corsa per domani",
-            "Crea sessione nuoto per dopodomani",
-            "Crea allenamento bici per giovedì",
-            "Crea sessione palestra per oggi",
-            "Crea un lungo di corsa per domenica",
-            "Crea interval training nuoto per venerdì",
-        ]
-        for i, q in enumerate(workout_quick):
-            with cols[i % 2]:
-                if st.button(q, use_container_width=True, key=f"qw_{i}"):
-                    send_message(q)
-                    st.rerun()
-
-    with tab3:
-        cols = st.columns(2)
-        piano_quick = [
-            "Crea un piano per questa settimana",
-            "Pianifica 5 allenamenti per i prossimi 7 giorni",
-            "Crea un piano triathlon per le prossime 2 settimane",
-            "Piano intenso questa settimana: nuoto, corsa e palestra",
-            "Piano di recupero per questa settimana",
-            "Crea un piano con focus sul nuoto per 10 giorni",
-        ]
-        for i, q in enumerate(piano_quick):
-            with cols[i % 2]:
-                if st.button(q, use_container_width=True, key=f"qp_{i}"):
-                    send_message(q)
-                    st.rerun()
+        with tab3:
+            cols = st.columns(2)
+            for i, q in enumerate([
+                "Crea un piano per questa settimana",
+                "Pianifica 5 allenamenti per i prossimi 7 giorni",
+                "Crea un piano triathlon per le prossime 2 settimane",
+                "Piano intenso: nuoto, corsa e palestra questa settimana",
+                "Piano di recupero per questa settimana",
+                "Piano con focus sul nuoto per 10 giorni",
+            ]):
+                with cols[i % 2]:
+                    if st.button(q, use_container_width=True, key=f"qp_{i}"):
+                        send_message(q)
+                        st.rerun()
 
     st.divider()
 
     # ── Storico chat ──────────────────────────────────────────────────────────
-    for msg in st.session_state.chat_history:
+    for idx, msg in enumerate(st.session_state.chat_history):
         if msg["role"] == "user":
             with st.chat_message("user"):
                 st.write(msg["content"])
         else:
             action = msg.get("action", "chat")
             avatar = {"workout_uploaded": "✅", "plan_uploaded": "✅",
-                      "analysis": "🔬"}.get(action, "🏅")
+                      "analysis": "🔬", "plan_preview": "📅",
+                      "workout_preview": "📋"}.get(action, "🏅")
 
             with st.chat_message("assistant", avatar=avatar):
                 st.markdown(msg["content"])
 
-                # Pulsanti inline per conferma workout
-                if action == "workout_preview" and st.session_state.pending_workout:
+                # ── Bottoni SOLO per l'ULTIMO messaggio di tipo preview ────────
+                is_last = (idx == len(st.session_state.chat_history) - 1)
+
+                if is_last and action == "workout_preview" and st.session_state.pending_workout:
+                    st.markdown("---")
+                    st.markdown("**Cosa vuoi fare?**")
                     c1, c2 = st.columns(2)
                     with c1:
-                        if st.button("✅ Sì, carica!", type="primary",
-                                     use_container_width=True, key=f"ci_wo_{id(msg)}"):
-                            send_message("Sì, confermo")
+                        if st.button("✅ Carica su Garmin", type="primary",
+                                     use_container_width=True, key=f"ci_wo_{idx}"):
+                            confirm_action("confermo")
                             st.rerun()
                     with c2:
                         if st.button("❌ Annulla", use_container_width=True,
-                                     key=f"cx_wo_{id(msg)}"):
-                            send_message("No, annulla")
+                                     key=f"cx_wo_{idx}"):
+                            confirm_action("annulla")
                             st.rerun()
 
-                # Pulsanti inline per conferma piano
-                if action == "plan_preview" and st.session_state.pending_plan:
+                if is_last and action == "plan_preview" and st.session_state.pending_plan:
+                    st.markdown("---")
+                    st.markdown("**Cosa vuoi fare?**")
                     c1, c2, c3 = st.columns(3)
                     with c1:
-                        if st.button("✅ Carica tutto!", type="primary",
-                                     use_container_width=True, key=f"ci_pl_{id(msg)}"):
-                            send_message("Sì, carica tutto")
+                        if st.button("✅ Carica tutto su Garmin", type="primary",
+                                     use_container_width=True, key=f"ci_pl_{idx}"):
+                            confirm_action("carica tutto")
                             st.rerun()
                     with c2:
-                        if st.button("🔍 Dettagli", use_container_width=True,
-                                     key=f"cd_pl_{id(msg)}"):
+                        if st.button("🔍 Vedi dettagli step", use_container_width=True,
+                                     key=f"cd_pl_{idx}"):
                             send_message("dettagli")
                             st.rerun()
                     with c3:
-                        if st.button("❌ Annulla", use_container_width=True,
-                                     key=f"cx_pl_{id(msg)}"):
-                            send_message("No, annulla")
+                        if st.button("❌ Annulla piano", use_container_width=True,
+                                     key=f"cx_pl_{idx}"):
+                            confirm_action("annulla")
                             st.rerun()
 
     # ── Input chat ────────────────────────────────────────────────────────────
-    user_input = st.chat_input(
-        "Chiedi un'analisi, crea un workout o un piano allenamenti..."
-    )
-    if user_input:
-        send_message(user_input)
-        st.rerun()
+    # Blocca input testuale se c'è un pending — SOLO bottoni
+    if st.session_state.pending_workout or st.session_state.pending_plan:
+        st.info("👆 Usa i pulsanti sopra per confermare o annullare prima di continuare.")
+    else:
+        user_input = st.chat_input(
+            "Chiedi un'analisi, crea un workout o un piano allenamenti..."
+        )
+        if user_input:
+            send_message(user_input)
+            st.rerun()
 
     if st.session_state.chat_history:
         if st.button("🗑️ Pulisci chat"):
@@ -362,26 +399,16 @@ elif page == "📋 Attività":
             if att.get("calorie"):
                 st.write(f"🔥 {att['calorie']} kcal")
 
-            # Analisi via chat
-            if st.button("🔬 Analizza con Coach", key=f"aa_{att.get('garmin_id')}"):
-                q = (f"Analizza questa attività: {att['sport']} del {att['data']}, "
-                     f"nome: {att['nome']}, "
+            if st.button("🔬 Analizza con Coach", key=f"aa_{att.get('garmin_id')}",
+                         type="primary", use_container_width=True):
+                q = (f"Analizza nel dettaglio questa attività: "
+                     f"{att['sport']} del {att['data']}, nome: {att['nome']}, "
                      f"{att['distanza_km']}km in {att['durata_str']}, "
                      f"FC {att['fc_media']}bpm, pace {att['pace']}. "
-                     f"Scarica i dati lap, cadenza e GPS e analizzali.")
-                # Manda alla chat e vai alla pagina chat
+                     f"Voglio vedere pace istantaneo km per km, HR, elevazione, cadenza e performance condition.")
                 send_message(q)
-                st.session_state.redirect_to_chat = True
-                r2 = requests.post(
-                    f"{API}/chat",
-                    json={"message": q, "conversation_id": "activity_analysis"},
-                    timeout=90,
-                )
-                st.info(r2.json().get("message", "Errore"))
+                st.success("✅ Analisi avviata! Vai su 💬 Chat per vedere i risultati.")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PAGINA CALENDARIO
-# ─────────────────────────────────────────────────────────────────────────────
 
 elif page == "📅 Calendario":
     st.subheader("📅 Calendario Allenamenti")
